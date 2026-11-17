@@ -1,24 +1,24 @@
-# Mino 沙箱（mino-sandbox）技术原理
+# Kuriboh 沙箱（kuriboh-sandbox）技术原理
 
-Mino 对两类高风险操作做 OS 级沙箱隔离：**系统命令 / 进程操作**（run_command / process_start / process_stop）与**文件读写搜索**（read_file / write_file / edit_file / list_directory / glob_search / grep_search）。本文说明这套沙箱的架构、平台实现与安全边界；使用层面的依赖与权限说明见 [README.md](README.md)。
+Kuriboh 对两类高风险操作做 OS 级沙箱隔离：**系统命令 / 进程操作**（run_command / process_start / process_stop）与**文件读写搜索**（read_file / write_file / edit_file / list_directory / glob_search / grep_search）。本文说明这套沙箱的架构、平台实现与安全边界；使用层面的依赖与权限说明见 [README.md](README.md)。
 
 ## 为什么是一个 Go sidecar
 
-OS 级沙箱机制（Linux bubblewrap / Windows AppContainer / macOS Seatbelt）都要求「先建立沙箱，再在沙箱内 exec 新进程」——进程无法把自己圈进沙箱。而 Node 无法放弃自身能力去 exec：主进程承载 webview 宿主、Agent 与 RPC，必须继续运行。因此所有受限操作交给独立二进制 `mino-sandbox`（`sandbox/` 用 Go 编写，`npm run build:sandbox` 产出）：Node spawn 它 → 它建立沙箱 → 沙箱内 exec 目标命令或自身。
+OS 级沙箱机制（Linux bubblewrap / Windows 受限访问令牌 / macOS Seatbelt）都要求「先建立沙箱，再在沙箱内 exec 新进程」——进程无法把自己圈进沙箱。而 Node 无法放弃自身能力去 exec：主进程承载 webview 宿主、Agent 与 RPC，必须继续运行。因此所有受限操作交给独立二进制 `kuriboh-sandbox`（`sandbox/` 用 Go 编写，`npm run build:sandbox` 产出）：Node spawn 它 → 它建立沙箱 → 沙箱内 exec 目标命令或自身。
 
 ```
 Node 主进程（src/tools.ts）
-    │ spawn mino-sandbox …
+    │ spawn kuriboh-sandbox …
     ▼
-mino-sandbox（Go sidecar）── 建立沙箱 ──▶ OS 沙箱
+kuriboh-sandbox（Go sidecar）── 建立沙箱 ──▶ OS 沙箱
     │                                      Linux:      bubblewrap + Landlock
-    │                                      Windows:    AppContainer + ACL
+    │                                      Windows:    Restricted Token + ACL
     │                                      macOS:      Seatbelt (sandbox-exec)
     ▼
 沙箱内执行：用户命令 / rg 搜索 / 自 exec 做纯 Go 文件 IO
 ```
 
-沙箱保证的语义（三平台一致）：**断网、系统目录只读、仅白名单目录可写**；读取不限制在工作区（读操作免确认）。
+沙箱保证的语义：**断网、全盘只读、仅白名单目录可写**；读取不限制在工作区，三平台全盘可读（uid / DACL 权限照常生效，他人私有文件照常拒绝）。已知取舍：Windows 受限令牌不拦 socket，沙箱内命令进程可联网（Linux / macOS 断网不变），见下文 Windows 章节。
 
 ## 两类调用方，两种失败语义
 
@@ -43,17 +43,16 @@ mino-sandbox（Go sidecar）── 建立沙箱 ──▶ OS 沙箱
 ## CLI 契约
 
 ```text
-mino-sandbox probe                                     # 探测沙箱机制可用（全保真，见下）
-mino-sandbox run   --cwd <dir> [--scope <ro|ws|home>] [--ro <dir>]… -- <argv…>
+kuriboh-sandbox probe                                     # 探测沙箱机制可用（全保真，见下）
+kuriboh-sandbox run   --cwd <dir> [--scope <ro|ws|home>] -- <argv…>
                                                        # 沙箱内执行，透传 stdio 与退出码
-mino-sandbox start  --cwd <dir> -- <argv…>             # 沙箱内启动，首行打印 pgid/pid 后退出
-mino-sandbox fs <read|write|list> --cwd <dir> --scope <ro|ws|home> -- <绝对路径>
+kuriboh-sandbox start  --cwd <dir> -- <argv…>             # 沙箱内启动，首行打印 pgid/pid 后退出
+kuriboh-sandbox fs <read|write|list> --cwd <dir> --scope <ro|ws|home> -- <绝对路径>
                                                        # 沙箱内文件 IO（write 经 stdin 传内容）
 ```
 
-- **不可用契约**：沙箱无法建立时，sidecar 以 stderr 首行 `MINO_SANDBOX_UNAVAILABLE: <原因>` + 退出码 125 退出。两者**同时成立**才判定「沙箱未建立」——退出码 125 单独不可信，用户命令也可能恰好退出 125。
+- **不可用契约**：沙箱无法建立时，sidecar 以 stderr 首行 `KURIBOH_SANDBOX_UNAVAILABLE: <原因>` + 退出码 125 退出。两者**同时成立**才判定「沙箱未建立」——退出码 125 单独不可信，用户命令也可能恰好退出 125。
 - **probe 全保真**：不是检查依赖二进制是否存在，而是按真实配置完整建一次沙箱、跑无害命令（Linux 上即 `bwrap + Landlock` 全量生效后执行 `/usr/bin/true`），能暴露 profile 语法错误、setuid 缺失等真实故障。Node 侧探测结果缓存到进程退出，避免每次操作都付出探测成本。
-- `--ro` 是额外只读授权目录，仅 Windows AppContainer 消费（容器读 rg 二进制所在目录、grep 单文件目标、sidecar 自身目录）；Linux/macOS 全盘本就可读，忽略该参数。
 
 ## 平台实现
 
@@ -69,9 +68,15 @@ bwrap（bubblewrap）通过 mount namespace 建立隔离：
 
 Landlock 是 Linux ≥ 5.13 内核自带的 LSM（无需安装，版本满足即自动启用）：对进程施加**内核态写入白名单**，白名单内路径之外的任何写打开直接 EACCES。bwrap 与 Landlock 互相独立、各自生效——bwrap 保证挂载布局，Landlock 保证即使布局被某种方式绕过，写权限仍被内核拦截。启用时机在沙箱内进程 exec 下一个程序之前（见「自 exec 双层设计」）。
 
-### Windows：AppContainer + ACL
+### Windows：Restricted Token（受限访问令牌）+ ACL
 
-使用系统内置的 AppContainer 轻量容器：容器默认无任何路径访问权，再用 ACL 逐一授权——ws/home 档对工作区 / 主目录授予读写，`--ro` 目录授予只读（RX）。容器同样没有网络授权，天然断网；临时目录为沙箱私有实例。读取用户主目录外的文件需目标目录在宿主 ACL 上对当前用户可见，且 `--ro` 显式授权。AppContainer 与 ACL 同为内核强制，双层独立生效。
+从自身令牌派生受限令牌（`CreateRestrictedToken`，标志 `DISABLE_MAX_PRIVILEGES | WRITE_RESTRICTED`），挂入固定的 Kuriboh 限制 SID。`WRITE_RESTRICTED` 的语义恰好对齐 Linux 的 `--ro-bind / /`：
+
+- **读放行**：读 / 执行访问只走普通 DACL 校验（用户身份不变）——**全盘可读**，他人私有文件照常被拒；`DISABLE_MAX_PRIVILEGES` 清空特权，封堵 SeBackup / SeTakeOwnership 等 ACL 旁路。
+- **写管住**：写访问走双重校验（普通 DACL **且** 限制 SID 获授权）——宿主盘上默认不含该 SID 的 ACE，**全盘默认禁写**；再按 scope 对白名单目录授予 F（ws=工作区，home=HOME ∪ 工作区），子目录容器继承。
+- **临时目录**：每次启动私有实例（授予 F 并重定向 `TEMP` / `TMP`），run 结束即删。
+- **进程清理**：Job Object（KILL_ON_JOB_CLOSE）+ 挂起启动、Assign 后 Resume，sidecar 退出即清场。
+- **已知取舍**：受限令牌不拦 socket，沙箱内命令进程**可联网**（Linux/macOS 断网不变，已确认接受）；Everyone 可写目录对沙箱进程可写（同 uid 语义，Linux 本就如此）。受限令牌与 ACL 为内核强制，单层防线即生效。
 
 ### macOS：Seatbelt（sandbox-exec）
 
@@ -94,8 +99,8 @@ Landlock 是 Linux ≥ 5.13 内核自带的 LSM（无需安装，版本满足即
 文件 IO 没有外部命令可借用（沙箱里没有 shell / cat），因此 fs 三操作用纯 Go 实现，同一二进制分内外两层跑：
 
 ```
-mino-sandbox fs read …            # 外层：解析参数 → 建沙箱 → 在沙箱内 exec 自身
-  └─ mino-sandbox _fsread …       # 内层：已在沙箱中，启用 Landlock → 直接 os.ReadFile
+kuriboh-sandbox fs read …            # 外层：解析参数 → 建沙箱 → 在沙箱内 exec 自身
+  └─ kuriboh-sandbox _fsread …       # 内层：已在沙箱中，启用 Landlock → 直接 os.ReadFile
 ```
 
 外层负责建立沙箱与授权，内层做纯 Go IO（write 的内容经 stdin 传入，含父目录自动创建）。`run` 在 Linux 上同理：bwrap 内 exec 自身 `_exec` 内层，启用 Landlock 后再 exec 用户目标命令，保证用户命令也受 Landlock 白名单约束。
@@ -105,12 +110,13 @@ mino-sandbox fs read …            # 外层：解析参数 → 建沙箱 → �
 - **写入 containment**：OS 按 ro/ws/home 三档硬性保证，见上表；确认后的区外写也仅限 HOME 与临时目录。
 - **symlink 逃逸封堵**：工作区 / 主目录解析真实路径后挂载与授权（Linux bind + Landlock 白名单、macOS 双写法），指向区外的符号链接无法借道。
 - **断网**：沙箱内 `curl` / `wget` / `pip install` 等联网命令一律不可用——防止「下载脚本直通本地盘」。信息检索类工具（web_search / web_fetch）在 Node 进程内直接请求，不经沙箱。
-- **进程管理**：process_stop 仅允许终止 Mino 自己启动的进程（pgid / pid 白名单，Unix 下组杀不误伤）。
+- **进程管理**：process_stop 仅允许终止 Kuriboh 自己启动的进程（pgid / pid 白名单，Unix 下组杀不误伤）。
 - **权限确认**：系统命令与进程操作无论什么权限级别都逐次经用户确认；文件写入按 readonly / workspace / full 三级确认（详见 AGENTS.md 红线 4）。
 
 ## 已知局限
 
 - macOS 后端编译级验证、待真机实测；
+- Windows 受限令牌不拦 socket：沙箱内命令进程可联网（Linux/macOS 断网不变），属已确认取舍；
 - 工作区或目标文件位于 `/tmp` 下时，Linux 的 `--tmpfs /tmp` 会遮蔽宿主 /tmp，read/list 将失败——工作区请放在常规目录；
 - rg 搜索与文件操作统一 30 秒超时；
 - fs write 为截断后写入、非原子：进程被强杀可能留下截断文件；
@@ -123,7 +129,7 @@ mino-sandbox fs read …            # 外层：解析参数 → 建沙箱 → �
 | `sandbox/main.go` | CLI 分发、125+marker 不可用契约、自 exec 内层 |
 | `sandbox/linux.go` | bwrap 参数构造（各平台文件中含头注释说明平台语义） |
 | `sandbox/landlock.go` / `landlock_stub.go` | Landlock 白名单（5.13+ 编译启用，旧内核空实现） |
-| `sandbox/windows.go` | AppContainer + ACL |
+| `sandbox/windows.go` | Restricted Token（受限访问令牌）+ ACL |
 | `sandbox/darwin.go` | Seatbelt profile |
 | `sandbox/fs.go` | fs 内层纯 Go IO（read / write / list） |
 | `sandbox/unix.go` | 进程等待与 SIGTERM 组杀 |

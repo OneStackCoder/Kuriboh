@@ -4,7 +4,7 @@ import path from "node:path";
 
 const CONFIG_ROOT =
   process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-export const CONFIG_DIR = path.join(CONFIG_ROOT, "Mino");
+export const CONFIG_DIR = path.join(CONFIG_ROOT, "Kuriboh");
 export const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 // Agent 会话（checkpointer）的 SQLite 持久化文件
 export const CHECKPOINT_DB = path.join(CONFIG_DIR, "checkpoints.sqlite");
@@ -15,9 +15,9 @@ export const WORKSPACES_FILE = path.join(CONFIG_DIR, "workspaces.json");
 
 // 应用级设置（代理 / 主题），独立于模型配置，未配置模型时也可保存
 export const SETTINGS_FILE = path.join(CONFIG_DIR, "settings.json");
-// 默认工作区目录：用户目录下 ~/mino/default_workspace
+// 默认工作区目录：用户目录下 ~/kuriboh/default_workspace
 export const DEFAULT_WORKSPACE_DIR = path.join(
-  os.homedir(), "mino", "default_workspace"
+  os.homedir(), "kuriboh", "default_workspace"
 );
 
 // 单个工作区条目（type 而非 interface：可直接 JSON 序列化进 webview RPC）
@@ -294,10 +294,18 @@ export type AppSettings = {
   theme: Theme;
   /** 工具面板宽度（像素），缺省用前端默认值 */
   panelWidth?: number;
+  /** 左侧会话栏宽度（像素），缺省用前端默认值 */
+  sidebarWidth?: number;
+  /** 聊天区内容最大宽度（像素），450–1600，缺省 860 */
+  chatWidth?: number;
   /** 正文字号（像素），12–20，缺省 15 */
   fontSize?: number;
   /** 会话标题字号（像素），11–20，缺省 13 */
   sessionTitleFontSize?: number;
+  /** 工作区文件页字号（像素），8–24，缺省 13 */
+  filesFontSize?: number;
+  /** 终端字号（像素），8–24，缺省 13 */
+  termFontSize?: number;
   /** 搜索设置：付费引擎开关（博查 / SerpAPI）；未启用时用当前模型商的搜索接口 */
   search: SearchSettings;
 };
@@ -336,6 +344,16 @@ export function loadSettings(): AppSettings {
         typeof m.panelWidth === "number" && Number.isFinite(m.panelWidth)
           ? Math.floor(m.panelWidth)
           : NaN;
+      const sw_ =
+        typeof m.sidebarWidth === "number" &&
+        Number.isFinite(m.sidebarWidth)
+          ? Math.floor(m.sidebarWidth)
+          : NaN;
+      const cw_ =
+        typeof m.chatWidth === "number" &&
+        Number.isFinite(m.chatWidth)
+          ? Math.floor(m.chatWidth)
+          : NaN;
       const fs_ =
         typeof m.fontSize === "number" && Number.isFinite(m.fontSize)
           ? Math.floor(m.fontSize)
@@ -345,12 +363,24 @@ export function loadSettings(): AppSettings {
         Number.isFinite(m.sessionTitleFontSize)
           ? Math.floor(m.sessionTitleFontSize)
           : NaN;
+      const wfs_ =
+        typeof m.filesFontSize === "number" && Number.isFinite(m.filesFontSize)
+          ? Math.floor(m.filesFontSize)
+          : NaN;
+      const tfs_ =
+        typeof m.termFontSize === "number" && Number.isFinite(m.termFontSize)
+          ? Math.floor(m.termFontSize)
+          : NaN;
       return {
         proxy: parseProxy(m.proxy),
         theme: m.theme === "dark" ? "dark" : "light",
         panelWidth: pw >= 160 && pw <= 2400 ? pw : undefined,
+        sidebarWidth: sw_ >= 200 && sw_ <= 480 ? sw_ : undefined,
+        chatWidth: cw_ >= 450 && cw_ <= 1600 ? cw_ : undefined,
         fontSize: fs_ >= 12 && fs_ <= 20 ? fs_ : undefined,
         sessionTitleFontSize: st_ >= 11 && st_ <= 20 ? st_ : undefined,
+        filesFontSize: wfs_ >= 8 && wfs_ <= 24 ? wfs_ : undefined,
+        termFontSize: tfs_ >= 8 && tfs_ <= 24 ? tfs_ : undefined,
         search: parseSearch(m.search),
       };
     }

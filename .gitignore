@@ -1,7 +1,7 @@
 node_modules
 build/
-# mino-sandbox sidecar 二进制（build:sandbox 产出与交叉编译散落产物）
-/mino-sandbox
-/mino-sandbox.exe
+# kuriboh-sandbox sidecar 二进制（build:sandbox 产出与交叉编译散落产物）
+/kuriboh-sandbox
+/kuriboh-sandbox.exe
 /sandbox/sandbox
 /sandbox/sandbox.exe

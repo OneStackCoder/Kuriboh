@@ -32,8 +32,6 @@ func baseBwrapArgs() []string {
 // 组装完整 bwrap 命令行：基础集 + 按 scope 的可写绑定 + 环境重定向 + 子命令。
 // HOME 继承宿主真实值（读 ~ 正常，ws 档写 ~ 被 rootfs 只读挡住）；
 // TMPDIR 指向私有 tmpfs。
-// roDirs 是 Windows 专用参数（AppContainer 逐路径授权读取），Linux 的
-// ro-bind / / 已全盘可读，忽略
 func bwrapCommand(cwd, scope string, argv []string, dieWithParent bool) *exec.Cmd {
 	args := baseBwrapArgs()
 	switch scope {
@@ -78,7 +76,7 @@ func sandboxProbe() error {
 	return nil
 }
 
-func sandboxRun(cwd, scope string, roDirs []string, argv []string) error {
+func sandboxRun(cwd, scope string, argv []string) error {
 	if scope == "home" {
 		// home 档绑定 $HOME，缺失/无效时明确报沙箱不可用而不是让 bwrap 报晦涩错误
 		home := os.Getenv("HOME")
@@ -90,8 +88,7 @@ func sandboxRun(cwd, scope string, roDirs []string, argv []string) error {
 		}
 	}
 	// runAndWait 在正常路径透传子命令退出码后 os.Exit，不返回；
-	// bwrap spawn 失败走 unavailable 出口，同样不返回。
-	// roDirs 忽略：Linux 全盘只读可见，无需逐路径授权
+	// bwrap spawn 失败走 unavailable 出口，同样不返回
 	runAndWait(bwrapCommand(cwd, scope, argv, true))
 	return nil
 }

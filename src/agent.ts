@@ -89,7 +89,7 @@ export function buildModel(config: AgentConfig) {
 }
 
 // ---------- 根据配置构建 Agent（网页端修改配置 / 切换工作区后可重建） ----------
-export type MinoAgent = ReturnType<typeof createMinoAgent>;
+export type KuribohAgent = ReturnType<typeof createKuribohAgent>;
 
 // 各权限级别的系统提示词说明（读取一律免确认；写入按权限管控，完全权限下命令与进程操作同样免确认）
 const PERMISSION_PROMPTS: Record<PermissionLevel, string> = {
@@ -522,14 +522,14 @@ function buildInterruptOn(workspaceDir: string, permission: PermissionLevel): Re
   return interruptOn;
 }
 
-export function createMinoAgent(config: AgentConfig, workspaceDir: string, permission: PermissionLevel, search: SearchSettings) {
+export function createKuribohAgent(config: AgentConfig, workspaceDir: string, permission: PermissionLevel, search: SearchSettings) {
   return createAgent({
     model: buildModel(config),
     // 计算器 / 时间 / 文件操作与搜索（写入按权限模式管控）/ 信息检索（Bocha 开关与模型商搜索）/ 系统工具（命令与进程，完全权限免确认，run_command 纯只读查询亦免确认，其余确认），定义见 src/tools.ts
     tools: createTools(workspaceDir, permission, search, config),
     systemPrompt:
       "你是一个乐于助人的中文助手。可使用提供的工具（计算、获取时间、文件读写、文件搜索、信息检索、系统命令与进程管理）完成任务和回答问题。" +
-      "需要操作本机系统时：run_command 执行命令（查询 CPU、内存、磁盘、网络、进程列表等），process_start 启动程序，process_stop 终止 Mino 启动的进程，open_application 打开应用、文件或网址；" +
+      "需要操作本机系统时：run_command 执行命令（查询 CPU、内存、磁盘、网络、进程列表等），process_start 启动程序，process_stop 终止 Kuriboh 启动的进程，open_application 打开应用、文件或网址；" +
       "run_command / process_start 默认在 OS 沙箱内执行（断网、系统目录只读、仅当前工作区可写），沙箱不可用时自动回退宿主机执行并在结果中标注；沙箱内跑不了 GUI 程序，打开应用请用 open_application；" +
       "这类操作不受工作区与文件权限限制；除「完全权限」模式外，修改类命令与进程操作执行前会先请用户确认（uname、ps、df、cat 配置文件这类纯只读查询命令直接执行），被拒绝后不要换个写法重试；" +
       "按文件名或路径模式找文件用 glob_search，在文件内容里找文本用 grep_search，找到路径后再用 read_file 读取；" +

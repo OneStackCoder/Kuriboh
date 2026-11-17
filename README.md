@@ -21,7 +21,7 @@
 | 平台      | 必需                                   | 可选 / 说明                                                            |
 | ------- | ------------------------------------ | ------------------------------------------------------------------ |
 | Linux   | WebKitGTK 4.1、`libxdo`、X11 或 Wayland | `zenity`：目录选择器；`script`（util-linux）：内嵌终端伪 PTY；`stty`：终端尺寸同步；`bash`；`bubblewrap`（bwrap）：OS 沙箱——文件工具必需，缺失时文件工具停用不回退；run_command / process_start 缺失时仍回退宿主机执行并在结果中标注 |
-| Windows | WebView2 Runtime、PowerShell          | Win11 与新版 Edge 自带 WebView2，Win10 缺失时会弹窗引导安装                        |
+| Windows | WebView2 Runtime、PowerShell          | Win11 与新版 Edge 自带 WebView2，Win10 缺失时会弹窗引导安装；内嵌终端装有 PowerShell 7+（pwsh）时优先使用，否则回退系统自带 5.1；行缓冲模式（无 PTY，Tab 补全 / 历史搜索等 readline 功能不可用，属已知取舍——不引入 node-pty） |
 | macOS   | 11 及以上（系统自带 WebKit）                  | `script`、`pgrep` / `ps`：终端尺寸同步                                     |
 
 Debian / Ubuntu 安装示例（包名因发行版而异）：
@@ -39,7 +39,7 @@ sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux bubblewrap
 npm install
 npm start                # 打开对话窗口（在「设置 → 模型」里添加模型配置）
 npm run typecheck        # tsc --noEmit 类型检查
-npm run build:local      # 编译 mino-sandbox sidecar，打包到 build/app，并编译本平台 launcher 到 build/（需 Go）
+npm run build:local      # 编译 kuriboh-sandbox sidecar，打包到 build/app，并编译本平台 launcher 到 build/（需 Go）
 ```
 
 支持 OpenAI / Anthropic / DeepSeek 及任意 OpenAI 兼容接口（Moonshot、智谱、本地网关等）。

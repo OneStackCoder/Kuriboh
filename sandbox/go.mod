@@ -1,4 +1,4 @@
-module mino/sandbox
+module kuriboh/sandbox
 
 go 1.21
 

@@ -12,7 +12,7 @@ import {
   type MessageContent,
 } from "@langchain/core/messages";
 import { Command } from "@langchain/langgraph";
-import { applyProxy, checkpointer, createMinoAgent, type MinoAgent } from "./agent.ts";
+import { applyProxy, checkpointer, createKuribohAgent, type KuribohAgent } from "./agent.ts";
 import {
   loadModelProfiles,
   saveModelProfiles,
@@ -168,7 +168,7 @@ function normalizeConfigInput(
 }
 
 // ---------- 校验前端提交的新增工作区 ----------
-// 相对路径按用户主目录解析（与默认工作区 ~/mino/... 同一基准）；
+// 相对路径按用户主目录解析（与默认工作区 ~/kuriboh/... 同一基准）；
 // 返回 { name, dir }：名称留空时取目录 basename
 function normalizeWorkspaceInput(
   input: unknown
@@ -231,18 +231,29 @@ function normalizeSettingsInput(input: unknown, current: AppSettings): AppSettin
       : NaN;
   const sessionTitleFontSize =
     stInput >= 11 && stInput <= 20 ? stInput : current.sessionTitleFontSize;
-  // 面板宽度由专用 RPC setPanelWidth 维护；普通 setSettings（改主题/代理/字号）不得丢失它
+  // 文件页 / 终端字号：8–24 之间的整数才接受，否则沿用现有值（首次为 undefined，前端用默认 13）
+  const clampPanelFs = (v: unknown, fallback: number | undefined) => {
+    const n = typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : NaN;
+    return n >= 8 && n <= 24 ? n : fallback;
+  };
+  const filesFontSize = clampPanelFs(m.filesFontSize, current.filesFontSize);
+  const termFontSize = clampPanelFs(m.termFontSize, current.termFontSize);
+  // 面板 / 会话栏宽度由专用 RPC 维护；普通 setSettings（改主题/代理/字号）不得丢失它们
   return {
     proxy,
     theme,
     panelWidth: current.panelWidth,
+    sidebarWidth: current.sidebarWidth,
+    chatWidth: current.chatWidth,
     fontSize,
     sessionTitleFontSize,
+    filesFontSize,
+    termFontSize,
     search: m.search === undefined ? current.search : parseSearch(m.search),
   };
 }
 
-// 推送给前端 window.onMinoAgentEvent 的事件（与 public/index.html 约定）
+// 推送给前端 window.onKuribohAgentEvent 的事件（与 public/index.html 约定）
 type UIEvent =
   | { type: "reasoning_start" }
   | { type: "reasoning_delta"; text: string }
@@ -265,7 +276,7 @@ type RunChatResult =
   | { status: "confirm"; calls: Array<{ name: string; args: unknown; description?: string }> };
 
 interface RunChatStreamParams {
-  agent: MinoAgent;
+  agent: KuribohAgent;
   // 首次调用传新消息；从中断恢复时传 Command({ resume: { decisions } })
   input: { messages: Array<{ role: "user"; content: string }> } | Command<Record<string, unknown>>;
   push: (ev: UIEvent) => void;
@@ -543,8 +554,8 @@ function historyToItems(messages: BaseMessage[]): HistoryItem[] {
   return items;
 }
 
-// 纯 Webview 方案：页面经 mino:// 自定义协议加载，不走 HTTP、不占端口
-// 前端→原生：window.MinoAgent.*（expose RPC）；原生→前端流式推送：window.onMinoAgentEvent 回调
+// 纯 Webview 方案：页面经 kuriboh:// 自定义协议加载，不走 HTTP、不占端口
+// 前端→原生：window.KuribohAgent.*（expose RPC）；原生→前端流式推送：window.onKuribohAgentEvent 回调
 export function startWebUI(): void {
   (async () => {
     const mod = await import("@webviewjs/webview");
@@ -563,7 +574,7 @@ export function startWebUI(): void {
       }
     }
     const win = app.createBrowserWindow({
-      title: "Mino",
+      title: "Kuriboh",
       width: 1300,
       height: 900,
       logical: true, // 尺寸按逻辑像素解释：HiDPI（scaleFactor=2）下物理像素会被缩放一半
@@ -579,7 +590,7 @@ export function startWebUI(): void {
     }
 
     // 注册协议必须在 createWebview 之前
-    win.registerProtocol("mino", async (request) => {
+    win.registerProtocol("kuriboh", async (request) => {
       const { pathname } = new URL(request.url);
       if (pathname === "/" || pathname === "/index.html") {
         return new Response(fs.readFileSync(INDEX_FILE), {
@@ -614,17 +625,19 @@ export function startWebUI(): void {
     // 单一主界面 webview：工具面板是页面内右侧栏，不再需要第二个 webview。
     // 顶层 webview 省略 bounds，可自动填满窗口并跟随 resize
     // Windows 下 WebView2 默认把数据目录建在 node.exe 所在目录（C:\Program Files\nodejs），
-    // 无写权限会直接报「无法读取和写入其数据目录」，改为指向 %LOCALAPPDATA%\Mino
+    // 无写权限会直接报「无法读取和写入其数据目录」，改为指向 %LOCALAPPDATA%\Kuriboh
     let webContext: ReturnType<typeof app.createWebContext> | undefined;
     if (process.platform === "win32") {
       const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
-      const dataDir = path.join(localAppData, "Mino");
+      const dataDir = path.join(localAppData, "Kuriboh");
       fs.mkdirSync(dataDir, { recursive: true });
       webContext = app.createWebContext({ dataDirectory: dataDir });
     }
-    const webview = win.createWebview({ url: "mino://localhost/", webContext });
+    const webview = win.createWebview({ url: "kuriboh://localhost/", webContext });
 
-    // 弹出系统目录选择器：Linux 用 zenity（GTK 原生目录对话框）；其余平台回退为选文件取其所在目录
+    // 弹出系统目录选择器：Linux 用 zenity、macOS 用 osascript、Windows 用
+    // PowerShell 跑 WinForms FolderBrowserDialog（WebView2 无原生目录选择 API）；
+    // 返回选中目录的绝对路径，用户取消返回 null
     const showDirectoryPicker = async (): Promise<string | null> => {
       if (process.platform === "linux") {
         return await new Promise<string | null>((resolve) => {
@@ -639,13 +652,46 @@ export function startWebUI(): void {
           );
         });
       }
-      const files = win.openFileDialog({ title: "请选择目标目录内的任意文件" });
-      return files.length ? path.dirname(files[0]) : null;
+      if (process.platform === "darwin") {
+        return await new Promise<string | null>((resolve) => {
+          execFile(
+            "osascript",
+            ["-e", 'POSIX path of (choose folder with prompt "选择工作区目录")'],
+            (err, stdout) => {
+              if (err) return resolve(null); // 用户取消（osascript 非零退出）
+              resolve(String(stdout).trim() || null);
+            }
+          );
+        });
+      }
+      // -STA：ShowDialog 要求 STA 线程；输出走 [Console]::Out 并切 UTF8，
+      // 防中文路径按 OEM 代码页乱码；windowsHide 防控制台黑框闪烁
+      return await new Promise<string | null>((resolve) => {
+        execFile(
+          "powershell.exe",
+          [
+            "-NoLogo",
+            "-STA",
+            "-NonInteractive",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms;" +
+              "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;" +
+              "$f = New-Object System.Windows.Forms.FolderBrowserDialog;" +
+              "$f.Description = '选择工作区目录';" +
+              "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($f.SelectedPath) }",
+          ],
+          { windowsHide: true },
+          (err, stdout) => {
+            if (err) return resolve(null); // 用户取消或 PowerShell 缺失
+            resolve(String(stdout).trim() || null);
+          }
+        );
+      });
     };
 
     const push = (ev: UIEvent) => {
       if (webview.isDisposed()) return;
-      webview.evaluateScript(`window.onMinoAgentEvent?.(${JSON.stringify(ev)})`);
+      webview.evaluateScript(`window.onKuribohAgentEvent?.(${JSON.stringify(ev)})`);
     };
 
     // 模型配置列表（可存多份，activeId 为当前生效的一份）
@@ -666,7 +712,7 @@ export function startWebUI(): void {
     let agentPermission: PermissionLevel = "workspace"; // 当前 agent 构建时的权限，用于判断是否需要重建
     // 当前 agent 构建时的搜索设置：引擎开关固化在工具集里，变化后需重建（见 syncAgent）
     let agentSearch: SearchSettings = settings.search;
-    let agent: MinoAgent | null = config ? createMinoAgent(config, activeWorkspace().path, permission, settings.search) : null;
+    let agent: KuribohAgent | null = config ? createKuribohAgent(config, activeWorkspace().path, permission, settings.search) : null;
     // 对话进行中改搜索设置 → 挂起，本轮结束后再重建，避免打断待恢复的权限确认流程
     let pendingSearchSync = false;
     // 当前会话线程 id：历史与压缩状态都挂在 checkpointer 的这个线程上
@@ -734,6 +780,28 @@ export function startWebUI(): void {
       return { name: path.basename(rel), size: stat.size, binary: false, truncated, text };
     };
 
+    // 在系统文件管理器中打开当前浏览目录（解析与 listDir 同一防线，限工作区内）
+    const panelOpenDir = async (rel: string) => {
+      const abs = panelResolvePath(rel);
+      if (!fs.statSync(abs).isDirectory()) throw new Error("这不是一个目录");
+      // 与 open_application 工具同一套打开方式：系统默认程序处理目录即文件管理器
+      const argv =
+        process.platform === "win32"
+          ? ["cmd", "/c", "start", "", abs] // start 的首个引号参数是窗口标题占位，缺省会被 target 占用
+          : process.platform === "darwin"
+            ? ["open", abs]
+            : ["xdg-open", abs];
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(argv[0], argv.slice(1), { detached: true, stdio: "ignore" });
+        child.once("error", reject);
+        child.once("spawn", () => {
+          child.unref(); // 脱离父进程：文件管理器独立于 Kuriboh 运行
+          resolve();
+        });
+      });
+      return { opened: abs };
+    };
+
     // ---------- 工具面板：内嵌终端 ----------
     // 不用 node-pty（免原生编译）：Linux/macOS 用 script 分配伪 PTY（bash/zsh 有完整交互回显），
     // Windows 直接行缓冲 powershell。输出经 base64 推给 window.onTermEvent，输入经 termWrite 回传
@@ -759,6 +827,40 @@ export function startWebUI(): void {
       webview.evaluateScript(`window.onTermEvent?.(${JSON.stringify({ id, ...ev })})`);
     };
 
+    // Windows 终端 shell 解析：pwsh.exe 只有 PowerShell 6+ 才有（5.1 叫 powershell.exe），
+    // 找到即视为「有新版」直接使用。pwsh 不一定在 PATH 里（MSI 装到固定目录），
+    // 所以同时扫 PATH 与系统 / 用户两个安装根目录（其下是 7、7-preview 等版本目录）
+    const resolveWinShell = (): string => {
+      const dirs = new Set<string>(
+        (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)
+      );
+      for (const root of [
+        process.env.ProgramFiles
+          ? path.join(process.env.ProgramFiles, "PowerShell")
+          : "",
+        process.env.LOCALAPPDATA
+          ? path.join(process.env.LOCALAPPDATA, "Microsoft", "PowerShell")
+          : "",
+      ]) {
+        if (!root) continue;
+        try {
+          for (const ver of fs.readdirSync(root)) dirs.add(path.join(root, ver));
+        } catch {
+          /* 根目录不存在或不可读，跳过 */
+        }
+      }
+      for (const dir of dirs) {
+        try {
+          if (fs.statSync(path.join(dir, "pwsh.exe")).isFile()) {
+            return path.join(dir, "pwsh.exe");
+          }
+        } catch {
+          /* 该目录下没有 pwsh.exe，继续找 */
+        }
+      }
+      return "powershell.exe";
+    };
+
     const termStart = (id: string, cols: number, rows: number): { running: boolean; id: string } => {
       const existing = termSessions.get(id);
       if (existing && !existing.child.killed) return { running: true, id }; // 复用已存活的会话
@@ -771,8 +873,8 @@ export function startWebUI(): void {
       };
       let child: ReturnType<typeof spawn>;
       if (process.platform === "win32") {
-        // windowsHide 防止在 GUI 进程里新建控制台窗口
-        child = spawn("powershell.exe", ["-NoLogo"], { cwd, env, windowsHide: true });
+        // windowsHide 防止在 GUI 进程里新建控制台窗口；装有 pwsh（PowerShell 7+）时优先于 5.1
+        child = spawn(resolveWinShell(), ["-NoLogo"], { cwd, env, windowsHide: true });
       } else {
         // 先在 PTY 内同步窗口尺寸，再 exec 到平台默认 shell
         const shell = process.platform === "darwin" ? "zsh" : "bash";
@@ -880,7 +982,7 @@ export function startWebUI(): void {
         config &&
         (agentPermission !== permission || !sameSearch(agentSearch, settings.search))
       ) {
-        agent = createMinoAgent(config, activeWorkspace().path, permission, settings.search);
+        agent = createKuribohAgent(config, activeWorkspace().path, permission, settings.search);
         agentPermission = permission;
         agentSearch = settings.search;
       }
@@ -920,7 +1022,7 @@ export function startWebUI(): void {
     // 当前配置变化后重建 agent 并开启新会话（旧会话仍保留在历史列表）
     const activateProfile = () => {
       permission = "workspace"; // 新会话回到默认权限
-      agent = config ? createMinoAgent(config, activeWorkspace().path, permission, settings.search) : null;
+      agent = config ? createKuribohAgent(config, activeWorkspace().path, permission, settings.search) : null;
       agentPermission = permission;
       agentSearch = settings.search;
       threadId = crypto.randomUUID();
@@ -986,7 +1088,7 @@ export function startWebUI(): void {
     // expose 的 stub 只注入当前页面，必须等页面加载完成后再注册
     webview.on("page-load-finished", () => {
       // 静态值 catalog/provider/model 同步可读；函数经 RPC 调用，返回值必须可 JSON 序列化
-      webview.expose("MinoAgent", {
+      webview.expose("KuribohAgent", {
         catalog: MODEL_CATALOG,
         provider: config?.provider ?? null,
         model: config?.model ?? null,
@@ -1127,7 +1229,7 @@ export function startWebUI(): void {
             workspaces.activeId = id;
             saveWorkspaces(workspaces);
             if (config) {
-              agent = createMinoAgent(config, target.path, permission, settings.search);
+              agent = createKuribohAgent(config, target.path, permission, settings.search);
               agentPermission = permission;
               agentSearch = settings.search;
             }
@@ -1164,7 +1266,7 @@ export function startWebUI(): void {
           workspaces.activeId = item.id;
           saveWorkspaces(workspaces);
           if (config) {
-            agent = createMinoAgent(config, dir, permission, settings.search);
+            agent = createKuribohAgent(config, dir, permission, settings.search);
             agentPermission = permission;
             agentSearch = settings.search;
           }
@@ -1181,7 +1283,7 @@ export function startWebUI(): void {
           if (workspaces.activeId === id) {
             workspaces.activeId = workspaces.items[0].id;
             if (config) {
-              agent = createMinoAgent(config, activeWorkspace().path, permission, settings.search);
+              agent = createKuribohAgent(config, activeWorkspace().path, permission, settings.search);
               agentPermission = permission;
               agentSearch = settings.search;
             }
@@ -1196,6 +1298,9 @@ export function startWebUI(): void {
         readFile(rel: string) {
           return panelReadFile(typeof rel === "string" ? rel : "");
         },
+        openDir(rel: string) {
+          return panelOpenDir(typeof rel === "string" ? rel : "");
+        },
         setPanelWidth(input: unknown) {
           const w =
             typeof input === "number" && Number.isFinite(input)
@@ -1205,6 +1310,26 @@ export function startWebUI(): void {
           settings = { ...settings, panelWidth: w };
           saveSettings(settings);
           return { panelWidth: w };
+        },
+        setSidebarWidth(input: unknown) {
+          const w =
+            typeof input === "number" && Number.isFinite(input)
+              ? Math.floor(input)
+              : NaN;
+          if (!(w >= 200 && w <= 480)) throw new Error("会话栏宽度需在 200 到 480 之间");
+          settings = { ...settings, sidebarWidth: w };
+          saveSettings(settings);
+          return { sidebarWidth: w };
+        },
+        setChatWidth(input: unknown) {
+          const w =
+            typeof input === "number" && Number.isFinite(input)
+              ? Math.floor(input)
+              : NaN;
+          if (!(w >= 450 && w <= 1600)) throw new Error("聊天区宽度需在 450 到 1600 之间");
+          settings = { ...settings, chatWidth: w };
+          saveSettings(settings);
+          return { chatWidth: w };
         },
         // ---------- 工具面板：内嵌终端 ----------
         termOpen(input: unknown) {
@@ -1397,7 +1522,7 @@ export function startWebUI(): void {
     win.on("close", () => process.exit(0));
     // app.run() 内部用 setInterval 泵原生事件，不阻塞 Node 事件循环
     app.run();
-    console.log("已打开 Mino 窗口，关闭窗口即可退出");
+    console.log("已打开 Kuriboh 窗口，关闭窗口即可退出");
   })().catch((err) => {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`打开窗口失败: ${message.split("\n")[0]}`);

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Mino</title>
+<title>Kuriboh</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   /* 作者样式里的 display:flex 会覆盖 hidden 属性的 UA 默认 display:none，
@@ -44,6 +44,7 @@
     --dir-color: #d9a94e;
     --font-size: 16px;
     --session-title-size: 13px;
+    --chat-max: 860px; /* 聊天内容（消息 + 输入框）最大宽度，拉伸条拖拽时 JS 改写 */
   }
   .dark {
     color-scheme: dark;
@@ -101,6 +102,10 @@
   }
   #newChat:hover { background: var(--accent-soft); border-color: var(--accent); }
   #sessions { flex: 1; overflow-y: auto; padding: 0 8px; }
+  /* 全局固定细滚动条：WebKit 默认 overlay 滚动条悬停会变粗（xterm 有自己的更具体规则，不受影响） */
+  ::-webkit-scrollbar { width: 3px; height: 3px; }
+  ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 2px; }
+  ::-webkit-scrollbar-track { background: transparent; }
   #sessionSearchWrap { position: relative; margin: 0 12px 10px; }
   #sessionSearchWrap svg {
     position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
@@ -166,16 +171,16 @@
     display: flex; flex-direction: row;
     background: var(--panel); border-left: 1px solid var(--border);
     min-height: 0; overflow: hidden;
+    --files-fs: 13px; /* 文件页字号（Ctrl+滚轮缩放，JS 动态改写） */
   }
-  #panelDrag {
+  #panelDrag, #sideDrag {
     width: 6px; flex-shrink: 0; cursor: col-resize; position: relative;
     user-select: none; -webkit-user-select: none;
   }
-  #panelDrag::after {
-    content: ''; position: absolute; left: 2px; top: 0; bottom: 0; width: 2px;
-    background: var(--border-strong); border-radius: 1px;
-  }
-  #panelDrag:hover::after, #panelDrag.on::after { background: var(--accent); }
+  /* 负 margin 让热区重叠在相邻面板边缘上，不占布局空间；
+     分隔条自身不画线，边界由侧栏 / 面板自带的 1px 边框承担 */
+  #sideDrag { margin-left: -6px; z-index: 5; }
+  #panelDrag { margin-right: -6px; z-index: 5; }
   body.panel-resizing { cursor: col-resize; }
   body.panel-resizing #main, body.panel-resizing #sidebar { pointer-events: none; }
   body.panel-resizing * { user-select: none; -webkit-user-select: none; }
@@ -237,17 +242,19 @@
   .crumb.cur { color: var(--text); font-weight: 600; cursor: default; }
   .crumb.cur:hover { background: transparent; }
   .crumb-sep { color: var(--text-3); user-select: none; }
-  #refreshBtn {
-    margin-left: auto; width: 24px; height: 24px; flex-shrink: 0;
+  #crumbs button {
+    width: 24px; height: 24px; flex-shrink: 0;
     display: inline-flex; align-items: center; justify-content: center;
     border: none; border-radius: 6px; background: transparent;
     color: var(--text-3); cursor: pointer; line-height: 0;
   }
-  #refreshBtn:hover { color: var(--text); background: var(--hover); }
+  #crumbs button:hover { color: var(--text); background: var(--hover); }
+  #openDirBtn { margin-left: auto; }
+  #refreshBtn { margin-left: 4px; }
   #fileList { flex: 1; overflow-y: auto; padding: 6px; }
   .frow {
     display: flex; align-items: center; gap: 8px;
-    padding: 6px 8px; border-radius: 8px; cursor: pointer; font-size: 13px;
+    padding: 6px 8px; border-radius: 8px; cursor: pointer; font-size: var(--files-fs, 13px);
   }
   .frow:hover { background: var(--hover); }
   .frow .ico { display: inline-flex; color: var(--text-3); flex-shrink: 0; }
@@ -275,7 +282,7 @@
   #pvMeta { color: var(--text-3); font-size: 11px; white-space: nowrap; margin-left: auto; }
   #pvBody {
     flex: 1; overflow: auto; padding: 10px 12px;
-    font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.6;
+    font-family: ui-monospace, Consolas, monospace; font-size: calc(var(--files-fs, 13px) - 1px); line-height: 1.6;
     background: var(--code-bg); color: var(--text);
     white-space: pre-wrap; overflow-wrap: break-word; word-break: break-all;
   }
@@ -314,7 +321,15 @@
   .ptab .ptab-close:hover { color: var(--text); background: var(--border-strong); }
   #newTermBtn { padding: 0 9px; }
   /* ---------- 右侧：对话主区 ---------- */
-  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+  /* 聊天区左右拉伸条：贴 #main 内缘的隐形热区（与 #sideDrag 同风格），拖动调内容最大宽度 */
+  #chatDragL, #chatDragR {
+    position: absolute; top: 0; bottom: 0; width: 6px;
+    cursor: col-resize; z-index: 5;
+  }
+  /* 贴内容边缘而非聊天区边缘，与侧栏 / 面板分隔条的热区错开；max(6px) 保证永不与它们相邻 */
+  #chatDragL { left: max(6px, calc((100% - var(--chat-max)) / 2 - 6px)); }
+  #chatDragR { right: max(6px, calc((100% - var(--chat-max)) / 2 - 6px)); }
   header {
     display: flex; align-items: center; gap: 12px;
     padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
@@ -328,7 +343,7 @@
   #toolPanelBtn:hover { background: var(--hover); color: var(--text); }
   #toolPanelBtn.active { color: var(--accent); background: var(--accent-soft); }
   #chat { flex: 1; overflow-y: auto; padding: 20px; }
-  #chat .inner { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+  #chat .inner { max-width: var(--chat-max); margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
   .msg { display: flex; flex-direction: column; }
   .msg .body {
     max-width: 86%; padding: 10px 14px; border-radius: 12px;
@@ -463,7 +478,7 @@
   /* ---------- 输入区（DeepSeek 风格：圆角容器 + 胶囊工具 + 圆形发送按钮） ---------- */
   footer { padding: 12px 20px 18px; background: var(--bg); }
   .input-box {
-    max-width: 860px; margin: 0 auto;
+    max-width: var(--chat-max); margin: 0 auto;
     background: var(--panel); border: 1px solid var(--border-strong); border-radius: 16px;
     padding: 10px 12px 8px;
     box-shadow: 0 1px 3px rgba(0, 0, 0, .04);
@@ -739,7 +754,7 @@
 </head>
 <body>
 <aside id="sidebar">
-  <div class="side-head">Mino</div>
+  <div class="side-head">Kuriboh</div>
   <button id="newChat" title="开启新的对话">＋ 开启新对话</button>
   <div id="sessionSearchWrap">
     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
@@ -754,12 +769,15 @@
     <div>会话保存在本机，重启后可继续</div>
   </div>
 </aside>
+<div id="sideDrag" title="拖动调整会话栏宽度"></div>
 <!-- 会话右键菜单（重命名 / 重新加载） -->
 <div id="ctxMenu" class="ctx-menu">
   <div class="ctx-item" id="ctxRename">重命名</div>
   <div class="ctx-item" id="ctxReload">重新加载</div>
 </div>
 <div id="main">
+  <div id="chatDragL" title="拖动调整聊天区宽度"></div>
+  <div id="chatDragR" title="拖动调整聊天区宽度"></div>
   <header>
     <span id="model"></span>
     <button id="toolPanelBtn" title="打开工具面板" aria-label="打开工具面板"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
@@ -834,7 +852,7 @@
       </div>
     </div>
     <div class="pview" id="viewFiles" hidden>
-      <div id="crumbs"><button id="refreshBtn" title="刷新"></button></div>
+      <div id="crumbs"><button id="openDirBtn" title="在系统文件管理器中打开"></button><button id="refreshBtn" title="刷新"></button></div>
       <div id="fileList"></div>
       <div id="filePreview" hidden>
         <div class="pv-head">
@@ -881,10 +899,10 @@
     <input id="wsNameInput" placeholder="如：我的项目（留空则用目录名）" autocomplete="off" />
     <label for="wsPathInput">目录路径</label>
     <div class="path-row">
-      <input id="wsPathInput" placeholder="如 /home/me/mino/my_project（不存在会自动创建）" autocomplete="off" />
+      <input id="wsPathInput" placeholder="如 /home/me/kuriboh/my_project（不存在会自动创建）" autocomplete="off" />
       <button id="wsBrowse" type="button">浏览…</button>
     </div>
-    <div class="hint">相对路径按用户主目录解析，如 mino/my_project；也可点「浏览」用系统选择器选取</div>
+    <div class="hint">相对路径按用户主目录解析，如 kuriboh/my_project；也可点「浏览」用系统选择器选取</div>
     <div class="err" id="wsErr"></div>
     <div class="actions">
       <button id="wsCancel">取消</button>
@@ -932,7 +950,7 @@
         stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
     </button>
     <h2>设置</h2>
-    <div class="sub">模型 / 代理 / 搜索 / 通用保存在本机 ~/.config/Mino/，仅本进程使用</div>
+    <div class="sub">模型 / 代理 / 搜索 / 通用保存在本机 ~/.config/Kuriboh/，仅本进程使用</div>
     <div class="settings-body">
       <nav class="settings-nav">
         <button class="snav active" data-tab="model">模型</button>
@@ -1093,7 +1111,7 @@
     <div class="sub">付费网页搜索，国内可直连；失败时自动回落模型商搜索</div>
     <label for="bochaApiKey">API Key</label>
     <input id="bochaApiKey" type="password" placeholder="在 open.bochaai.com 申请" autocomplete="off" />
-    <div class="hint">仅保存在本机 ~/.config/Mino/，不会上传</div>
+    <div class="hint">仅保存在本机 ~/.config/Kuriboh/，不会上传</div>
     <div class="actions">
       <button id="bochaConfigDone" class="primary">完成</button>
     </div>
@@ -1107,7 +1125,7 @@
     <label for="serpapiApiKey">API Key</label>
     <input id="serpapiApiKey" type="password" placeholder="在 serpapi.com 申请" autocomplete="off" />
     <div class="hint">会依次使用 Google 和 Brave 两个引擎：优先 Google，搜不到自动换 Brave</div>
-    <div class="hint">仅保存在本机 ~/.config/Mino/，不会上传</div>
+    <div class="hint">仅保存在本机 ~/.config/Kuriboh/，不会上传</div>
     <div class="actions">
       <button id="serpapiConfigDone" class="primary">完成</button>
     </div>
@@ -1138,10 +1156,10 @@
   marked.use(window.markedKatex({ throwOnError: false, nonStandard: true }));
 
   // 原生 RPC 在页面加载完成后才注入，轮询等待就绪
-  const waitMinoAgent = () => new Promise((resolve) => {
-    if (window.MinoAgent) return resolve();
+  const waitKuribohAgent = () => new Promise((resolve) => {
+    if (window.KuribohAgent) return resolve();
     const timer = setInterval(() => {
-      if (window.MinoAgent) { clearInterval(timer); resolve(); }
+      if (window.KuribohAgent) { clearInterval(timer); resolve(); }
     }, 50);
   });
 
@@ -1290,7 +1308,7 @@
   async function activateSavedModel(id) {
     if (busy || id === modelsState.activeId) return;
     try {
-      applyModels(await window.MinoAgent.setActiveModel(id));
+      applyModels(await window.KuribohAgent.setActiveModel(id));
       await resetChatForNewSession();
       const m = activeModel();
       showWsMsg('已切换模型：' + (m ? m.model : '') + '（已开启新会话）');
@@ -1304,7 +1322,7 @@
     btn.classList.add('testing'); // 测试期间图标旋转
     btn.title = '测试中…';
     try {
-      await window.MinoAgent.testModel(m.id);
+      await window.KuribohAgent.testModel(m.id);
       showWsMsg('连接成功：' + m.model);
     } catch (err) {
       showWsMsg('连接失败：' + err.message);
@@ -1544,7 +1562,7 @@
     selectedFontSize = px;
     applyFontSize(px);
     // 立即持久化：后端对漏传字段沿用现值，但 proxy/theme 属整体覆盖，需显式带上
-    window.MinoAgent
+    window.KuribohAgent
       ?.setSettings({ theme: activeSettings.theme, proxy: activeSettings.proxy, fontSize: px })
       .catch(() => {});
   });
@@ -1681,7 +1699,7 @@
       if (!ok) return;
     }
     try {
-      const r = await window.MinoAgent.setPermission(level);
+      const r = await window.KuribohAgent.setPermission(level);
       currentPermission = r.permission;
       renderPermBtn();
     } catch (err) {
@@ -1709,7 +1727,7 @@
     const engineOrder = Array.from(searchPanel.querySelectorAll('.engine-card'))
       .map((c) => (c.id === 'bochaCard' ? 'bocha' : 'serpapi'));
     try {
-      const s = await window.MinoAgent.setSettings({
+      const s = await window.KuribohAgent.setSettings({
         proxy: {
           protocol: proxyProtocol.value,
           host: proxyHost.value.trim(),
@@ -1766,8 +1784,8 @@
     const editedActive = !!editingModelId && editingModelId === prevActiveId;
     try {
       const state = editingModelId
-        ? await window.MinoAgent.updateModel({ id: editingModelId, ...payload })
-        : await window.MinoAgent.addModel(payload);
+        ? await window.KuribohAgent.updateModel({ id: editingModelId, ...payload })
+        : await window.KuribohAgent.addModel(payload);
       applyModels(state);
       // 改的是当前模型（或首次新增自动启用）时，原生侧已开启新会话
       if (editedActive || modelsState.activeId !== prevActiveId) await resetChatForNewSession();
@@ -1791,7 +1809,7 @@
     if (!m) return;
     const wasActive = m.id === modelsState.activeId;
     try {
-      applyModels(await window.MinoAgent.deleteModel(m.id));
+      applyModels(await window.KuribohAgent.deleteModel(m.id));
       if (wasActive) await resetChatForNewSession();
     } catch (err) {
       settingsErr.textContent = err.message;
@@ -1817,7 +1835,7 @@
     testConnBtn.disabled = true;
     testConnBtn.textContent = '测试中…';
     try {
-      await window.MinoAgent.testConnection({
+      await window.KuribohAgent.testConnection({
         id: editingModelId || '',
         provider: provSel.value,
         model,
@@ -1857,7 +1875,7 @@
   const aboutRepoLink = document.getElementById('aboutRepoLink');
   aboutRepoLink.onclick = (e) => {
     e.preventDefault();
-    window.MinoAgent.openExternal(aboutRepoLink.href).catch(() => {});
+    window.KuribohAgent.openExternal(aboutRepoLink.href).catch(() => {});
   };
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) { overlay.hidden = true; applyTheme(activeSettings.theme); }
@@ -1935,7 +1953,7 @@
         if (busy || isActive) return;
         if (locked) { showWsMsg('已有对话历史，不能切换工作区（可先点「新对话」）'); return; }
         try {
-          wsState = await window.MinoAgent.setWorkspace(w.id);
+          wsState = await window.KuribohAgent.setWorkspace(w.id);
           refreshToolPanel(); // 面板回到新工作区根目录
         } catch (err) {
           showWsMsg(err.message);
@@ -1954,7 +1972,7 @@
   }
 
   async function refreshWorkspaces() {
-    wsState = await window.MinoAgent.getWorkspaces();
+    wsState = await window.KuribohAgent.getWorkspaces();
     renderWorkspaces();
   }
 
@@ -1991,7 +2009,7 @@
   document.getElementById('wsCancel').onclick = () => { wsOverlay.hidden = true; };
   document.getElementById('wsBrowse').onclick = async () => {
     try {
-      const dir = await window.MinoAgent.pickDirectory();
+      const dir = await window.KuribohAgent.pickDirectory();
       if (dir) wsPathInput.value = dir;
     } catch (err) {
       wsErr.textContent = err.message;
@@ -2000,7 +2018,7 @@
   async function saveWorkspace() {
     wsErr.textContent = '';
     try {
-      wsState = await window.MinoAgent.addWorkspace({
+      wsState = await window.KuribohAgent.addWorkspace({
         name: wsNameInput.value,
         path: wsPathInput.value,
       });
@@ -2038,7 +2056,7 @@
       `删除工作区「${w.name}」（${w.path}）？仅从列表移除，不会删除磁盘上的目录。`,
       async () => {
         try {
-          wsState = await window.MinoAgent.deleteWorkspace(wsState.activeId);
+          wsState = await window.KuribohAgent.deleteWorkspace(wsState.activeId);
           refreshToolPanel(); // 面板切到删除后生效的工作区
           renderWorkspaces();
         } catch (err) {
@@ -2068,7 +2086,7 @@
     const id = pendingDeleteSessionId;
     pendingDeleteSessionId = null;
     if (!id) return;
-    const r = await window.MinoAgent.deleteSession(id);
+    const r = await window.KuribohAgent.deleteSession(id);
     if (r && r.cleared) {
       // 删除的是当前会话：原生侧已开启新会话，界面清空；权限回到默认值
       list.innerHTML = '';
@@ -2197,7 +2215,7 @@
     return btn;
   }
   async function copyText(text) {
-    // mino:// 自定义协议下通常不是 secure context，clipboard API 可能不可用，兜底 execCommand
+    // kuriboh:// 自定义协议下通常不是 secure context，clipboard API 可能不可用，兜底 execCommand
     if (navigator.clipboard && window.isSecureContext) {
       try { await navigator.clipboard.writeText(text); return; } catch {}
     }
@@ -2373,7 +2391,7 @@
       const bar = el('div', 'confirm-bar');
       const submit = () => {
         bar.remove();
-        window.MinoAgent
+        window.KuribohAgent
           .resolveConfirm({
             decisions: decisions.map((d) => d || { type: 'reject', message: '用户拒绝执行该操作' }),
           })
@@ -2477,7 +2495,7 @@
   }
 
   async function refreshSessions() {
-    const sessList = await window.MinoAgent.listSessions();
+    const sessList = await window.KuribohAgent.listSessions();
     // 搜索框按标题过滤（大小写不敏感）
     const q = sessionQuery;
     const shown = q ? sessList.filter((s) => (s.title || '').toLowerCase().includes(q)) : sessList;
@@ -2528,7 +2546,7 @@
       item.appendChild(del);
       item.onclick = async () => {
         if (busy || s.id === currentSessionId) return;
-        const detail = await window.MinoAgent.openSession(s.id);
+        const detail = await window.KuribohAgent.openSession(s.id);
         currentSessionId = detail.id;
         currentPermission = detail.permission; // 恢复该会话的权限设置
         renderPermBtn();
@@ -2560,7 +2578,7 @@
     editingId = null;
     const val = inp.value.trim();
     if (save && val && val !== s.title) {
-      await window.MinoAgent.renameSession({ id: s.id, title: val });
+      await window.KuribohAgent.renameSession({ id: s.id, title: val });
     }
     await refreshSessions();
   }
@@ -2591,10 +2609,10 @@
   document.getElementById('ctxReload').onclick = async () => {
     hideCtxMenu();
     if (busy) return;
-    applyModels(await window.MinoAgent.getModels());
+    applyModels(await window.KuribohAgent.getModels());
     await refreshWorkspaces();
     if (currentSessionId) {
-      const detail = await window.MinoAgent.openSession(currentSessionId);
+      const detail = await window.KuribohAgent.openSession(currentSessionId);
       currentPermission = detail.permission;
       renderPermBtn();
       renderHistory(detail.items);
@@ -2647,7 +2665,7 @@
 
   document.getElementById('newChat').onclick = async () => {
     if (busy) return;
-    await window.MinoAgent.newSession();
+    await window.KuribohAgent.newSession();
     currentSessionId = null;
     currentPermission = 'workspace'; // 新会话回到默认权限
     renderPermBtn();
@@ -2673,9 +2691,9 @@
     const body = addMsg('ai');
     createThinkPanel(body); // 占位「正在思考…」；reasoning 到达后转为思考面板
     try {
-      // 流式事件经 window.onMinoAgentEvent 回调推送，chat 结束即本轮完成
-      window.onMinoAgentEvent = (ev) => handleEvent(ev, body);
-      const r = await window.MinoAgent.chat(text);
+      // 流式事件经 window.onKuribohAgentEvent 回调推送，chat 结束即本轮完成
+      window.onKuribohAgentEvent = (ev) => handleEvent(ev, body);
+      const r = await window.KuribohAgent.chat(text);
       currentSessionId = r ? r.sessionId : currentSessionId;
     } catch (err) {
       body._think?.finish(); // 未收到任何事件：撤掉占位或折叠思考面板
@@ -2718,6 +2736,7 @@
   const pvBody = document.getElementById('pvBody');
   const pvBack = document.getElementById('pvBack');
   const refreshBtn = document.getElementById('refreshBtn');
+  const openDirBtn = document.getElementById('openDirBtn');
 
   const ICON_FOLDER = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.6 3.9A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>';
   const ICON_FILE = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>';
@@ -2738,6 +2757,13 @@
   const clampPanelW = (w) =>
     Math.floor(Math.min(Math.max(w, 280), Math.max(280, window.innerWidth - 608)));
   function applyPanelW() { toolPanel.style.width = panelW + 'px'; }
+
+  // 左侧会话栏宽度（px）：CSS 默认 248；下限 200，上限 480，拖拽结束后持久化
+  const sidebar = document.getElementById('sidebar');
+  const sideDrag = document.getElementById('sideDrag');
+  let sideW = 248;
+  const clampSideW = (w) => Math.floor(Math.min(Math.max(w, 200), 480));
+  const applySideW = () => { sidebar.style.width = sideW + 'px'; };
 
   function setPanelOpen(open) {
     panelOpen = open;
@@ -2764,12 +2790,10 @@
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
       document.body.classList.remove('panel-resizing');
-      panelDrag.classList.remove('on');
-      try { window.MinoAgent.setPanelWidth(panelW); } catch { /* 持久化失败不影响使用 */ }
+      try { window.KuribohAgent.setPanelWidth(panelW); } catch { /* 持久化失败不影响使用 */ }
       resizeTerm(); // bash 收到 SIGWINCH，换行宽度立即生效
     };
     document.body.classList.add('panel-resizing');
-    panelDrag.classList.add('on');
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
   });
@@ -2781,6 +2805,63 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(resizeTerm, 150);
   });
+
+  // ---------- 左侧会话栏分隔条拖拽：栏贴左侧，鼠标右移 = 加宽 ----------
+  sideDrag.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sideW;
+    const move = (ev) => {
+      sideW = clampSideW(startW + (ev.clientX - startX));
+      applySideW();
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.classList.remove('panel-resizing');
+      try { window.KuribohAgent.setSidebarWidth(sideW); } catch { /* 持久化失败不影响使用 */ }
+    };
+    document.body.classList.add('panel-resizing');
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+
+  // ---------- 聊天区内容宽度（消息 + 输入框共享 max-width）：左右拉伸条 ----------
+  const chatDragL = document.getElementById('chatDragL');
+  const chatDragR = document.getElementById('chatDragR');
+  let chatW = 860;
+  const clampChatW = (w) => Math.floor(Math.min(Math.max(w, 450), 1600));
+  const chatMain = document.getElementById('main');
+  const applyChatW = () => {
+    document.documentElement.style.setProperty('--chat-max', chatW + 'px');
+  };
+  const dragChat = (bar, dir) => {
+    bar.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = chatW;
+      // 上限同时受聊天区实际宽度约束：拖到内容填满即顶住，条始终可抓、反拖随时见效
+      const maxW = Math.min(1600, chatMain.clientWidth);
+      const move = (ev) => {
+        // 左条向左拖、右条向右拖 = 加宽，两条方向相反
+        chatW = Math.floor(Math.min(Math.max(startW + dir * (ev.clientX - startX), 450), maxW));
+        applyChatW();
+      };
+      const up = () => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        document.body.classList.remove('panel-resizing');
+        try { window.KuribohAgent.setChatWidth(chatW); } catch { /* 持久化失败不影响使用 */ }
+      };
+      document.body.classList.add('panel-resizing');
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+  };
+  dragChat(chatDragL, -1);
+  dragChat(chatDragR, 1);
 
   // ---------- 页签：开始页 / 工作区文件唯一 / 终端可多开 ----------
   const startBtn = document.querySelector('.ptab[data-ptab="start"]');
@@ -2820,6 +2901,7 @@
         crumbs.appendChild(crumb);
       });
     }
+    crumbs.appendChild(openDirBtn);
     crumbs.appendChild(refreshBtn);
   }
 
@@ -2851,7 +2933,7 @@
 
   async function loadDir(rel) {
     try {
-      const r = await window.MinoAgent.listDir(rel);
+      const r = await window.KuribohAgent.listDir(rel);
       curRel = r.rel;
       previewRel = null;
       filePreview.hidden = true;
@@ -2871,7 +2953,7 @@
 
   async function openPreview(rel) {
     try {
-      const f = await window.MinoAgent.readFile(rel);
+      const f = await window.KuribohAgent.readFile(rel);
       previewRel = rel;
       fileList.hidden = true;
       filePreview.hidden = false;
@@ -2888,7 +2970,12 @@
   }
 
   pvBack.onclick = closePreview;
-  // 刷新图标（环形箭头）
+  // 打开图标（外部链接）：在系统文件管理器中打开当前目录；刷新图标（环形箭头）
+  openDirBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
+  openDirBtn.onclick = async () => {
+    try { await window.KuribohAgent.openDir(curRel); }
+    catch (err) { showWsMsg(err.message || String(err)); }
+  };
   refreshBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></svg>';
   refreshBtn.onclick = () => {
     if (previewRel) openPreview(previewRel);
@@ -2942,7 +3029,46 @@
     const t = activeTerm();
     if (!t || !t.term) return;
     fitTerm();
-    window.MinoAgent.termResize({ id: t.id, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+    window.KuribohAgent.termResize({ id: t.id, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+  }
+
+  // ---------- 面板字号：文件页 / 终端 Ctrl+滚轮缩放，持久化到 settings ----------
+  let filesFs = 13;
+  let termFs = 13;
+  const applyFilesFs = () => { toolPanel.style.setProperty('--files-fs', filesFs + 'px'); };
+  const applyTermFs = () => {
+    // 所有已开终端一起改；非激活终端 holder 尺寸为 0，等激活时 ResizeObserver 再算行列
+    for (const t of terminals.values()) {
+      if (t.term) t.term.options.fontSize = termFs;
+    }
+    resizeTerm();
+  };
+  // 滚轮是连续事件，防抖 400ms 再写盘（theme/proxy 属整体覆盖字段，保存时需显式带上）
+  let fsSaveTimer = 0;
+  const saveFsLater = () => {
+    clearTimeout(fsSaveTimer);
+    fsSaveTimer = setTimeout(() => {
+      window.KuribohAgent
+        ?.setSettings({ theme: activeSettings.theme, proxy: activeSettings.proxy, filesFontSize: filesFs, termFontSize: termFs })
+        .catch(() => {});
+    }, 400);
+  };
+  const zoomFs = (which, delta) => {
+    const cur = which === 'files' ? filesFs : termFs;
+    const next = Math.min(24, Math.max(8, cur + delta));
+    if (next === cur) return;
+    if (which === 'files') { filesFs = next; applyFilesFs(); }
+    else { termFs = next; applyTermFs(); }
+    saveFsLater();
+  };
+  for (const [el, which] of [[viewFiles, 'files'], [termViews, 'term']]) {
+    // 捕获阶段先于 xterm 的视口滚动处理截住；stopPropagation 防 Ctrl+滚轮被当成回滚视口
+    el.addEventListener('wheel', (e) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault(); // 拦掉引擎自带的整页缩放，避免和字号调整叠加
+      e.stopPropagation();
+      zoomFs(which, e.deltaY < 0 ? 1 : -1);
+    }, { capture: true, passive: false });
   }
 
   // 终端页签按钮（标题 + 关闭）
@@ -2979,7 +3105,7 @@
     t.deadMsg = deadMsg;
     t.restart = restart;
     restart.onclick = () => {
-      try { window.MinoAgent.termKill({ id: t.id }); } catch { /* 忽略 */ }
+      try { window.KuribohAgent.termKill({ id: t.id }); } catch { /* 忽略 */ }
       if (t.term) t.term.reset();
       startTermBackend(t);
     };
@@ -3025,7 +3151,7 @@
       if (!t.term) return;
       const cols = termCols(t), rows = termRows(t);
       if (cols !== t.term.cols || rows !== t.term.rows) t.term.resize(cols, rows);
-      window.MinoAgent.termResize({ id: t.id, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+      window.KuribohAgent.termResize({ id: t.id, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
     });
     if (t.term) t.term.focus();
   }
@@ -3033,7 +3159,7 @@
   function closeTerminal(id) {
     const t = terminals.get(id);
     if (!t) return;
-    try { window.MinoAgent.termKill({ id }); } catch { /* 忽略 */ }
+    try { window.KuribohAgent.termKill({ id }); } catch { /* 忽略 */ }
     if (t.term) { try { t.term.dispose(); } catch { /* 忽略 */ } }
     if (t.ro) { try { t.ro.disconnect(); } catch { /* 忽略 */ } }
     t.btn.remove();
@@ -3057,7 +3183,7 @@
       cols: termCols(t),
       rows: termRows(t),
       fontFamily: 'Ubuntu Mono, Menlo, Consolas, monospace',
-      fontSize: 13,
+      fontSize: termFs,
       lineHeight: 1.25,
       cursorBlink: true,
       scrollback: 4000,
@@ -3072,7 +3198,7 @@
         const cols = termCols(t), rows = termRows(t);
         if (cols !== t.term.cols || rows !== t.term.rows) {
           t.term.resize(cols, rows);
-          window.MinoAgent.termResize({ id: t.id, cols, rows }).catch(() => {});
+          window.KuribohAgent.termResize({ id: t.id, cols, rows }).catch(() => {});
         }
       });
       ro.observe(t.holder);
@@ -3087,7 +3213,7 @@
       for (let i = 0; i < bytes.length; i += 8192) {
         s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
       }
-      window.MinoAgent.termWrite({ id: t.id, data: btoa(s) });
+      window.KuribohAgent.termWrite({ id: t.id, data: btoa(s) });
     });
     startTermBackend(t);
   }
@@ -3095,7 +3221,7 @@
   async function startTermBackend(t) {
     t.dead.hidden = true;
     try {
-      await window.MinoAgent.termOpen({ id: t.id, cols: t.term.cols, rows: t.term.rows });
+      await window.KuribohAgent.termOpen({ id: t.id, cols: t.term.cols, rows: t.term.rows });
       t.term.focus();
     } catch (err) {
       t.term.writeln('\x1b[31m终端启动失败：' + (err.message || err) + '\x1b[0m');
@@ -3121,14 +3247,29 @@
     }
   };
 
-  waitMinoAgent().then(async () => {
-    catalog = window.MinoAgent.catalog ?? [];
-    applyModels(await window.MinoAgent.getModels());
-    const st = await window.MinoAgent.getSettings();
+  waitKuribohAgent().then(async () => {
+    catalog = window.KuribohAgent.catalog ?? [];
+    applyModels(await window.KuribohAgent.getModels());
+    const st = await window.KuribohAgent.getSettings();
     applySettings(st);
     if (typeof st.panelWidth === 'number' && st.panelWidth >= 160) {
       panelW = clampPanelW(st.panelWidth);
       applyPanelW(); // 恢复上次拖拽保存的面板宽度
+    }
+    if (typeof st.sidebarWidth === 'number') {
+      sideW = clampSideW(st.sidebarWidth);
+      applySideW(); // 恢复上次拖拽保存的会话栏宽度
+    }
+    if (typeof st.chatWidth === 'number') {
+      chatW = clampChatW(st.chatWidth);
+      applyChatW(); // 恢复上次拖拽保存的聊天区内容宽度
+    }
+    if (typeof st.filesFontSize === 'number') {
+      filesFs = Math.min(24, Math.max(8, st.filesFontSize));
+      applyFilesFs(); // 恢复文件页缩放字号
+    }
+    if (typeof st.termFontSize === 'number') {
+      termFs = Math.min(24, Math.max(8, st.termFontSize)); // 终端在 ensureTerm 创建时取 termFs
     }
     renderPermBtn(); // 权限胶囊初始显示（新会话默认：工作区内修改）
     await refreshWorkspaces();

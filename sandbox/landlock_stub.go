@@ -1,7 +1,7 @@
 //go:build !linux
 
 // 非 Linux 无 Landlock：内层不设第二道防线——macOS Seatbelt 与
-// Windows AppContainer+ACL 本身就是内核级强制，单层防线即生效。
+// Windows 受限令牌+ACL 本身就是内核级强制，单层防线即生效。
 package main
 
 func enableLandlock(scope, cwd string) {}

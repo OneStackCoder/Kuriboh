@@ -68,18 +68,18 @@ const getCurrentTime = tool(
 // 不属于文件权限模型：agent.ts 中对这几个工具单独配置 humanInTheLoopMiddleware，
 // 无论权限级别如何，每次执行前都会先请用户确认。
 // run_command / process_start 优先在 OS 沙箱内执行（sidecar 是 sandbox/ 编出的
-// mino-sandbox：断网、系统只读、仅工作区可写），沙箱未建立时回退宿主机执行；
+// kuriboh-sandbox：断网、系统只读、仅工作区可写），沙箱未建立时回退宿主机执行；
 // open_application 面向 GUI（沙箱内无显示服务），只在宿主机执行。
 
 // sidecar 位置：开发态由 build:sandbox 产出在项目根，打包态由 CI 复制进应用目录
 const SANDBOX_BIN = path.join(
   process.cwd(),
-  `mino-sandbox${process.platform === "win32" ? ".exe" : ""}`
+  `kuriboh-sandbox${process.platform === "win32" ? ".exe" : ""}`
 );
 // 「沙箱不可用」判定契约：退出码 125 且 stderr 首行为 marker，两者同时成立才可信
 //（用户命令也可能恰好退出 125）
 const SANDBOX_EXIT = 125;
-const SANDBOX_MARKER = "MINO_SANDBOX_UNAVAILABLE:";
+const SANDBOX_MARKER = "KURIBOH_SANDBOX_UNAVAILABLE:";
 
 // 可用性探测结果缓存到进程退出：不可用（sidecar 缺失 / 探测超时 / 非零退出）
 // 时不反复探测。缓存带原因：run_command/process_start 回退时只判 ok，
@@ -187,16 +187,14 @@ function runShellCommand(
 type SandboxScope = "ro" | "ws" | "home";
 
 // 沙箱内执行用户命令（sidecar run 子命令），结果附 unavailable 原因。
-// scope 三档与 roDirs 只读授权由文件/搜索工具消费；run_command 不传维持 ws 现语义
+// scope 三档由文件/搜索工具消费；run_command 不传维持 ws 现语义
 function runInSandbox(
   argv: string[],
   cwd: string,
   timeoutMs: number,
-  scope: SandboxScope = "ws",
-  roDirs: string[] = []
+  scope: SandboxScope = "ws"
 ): Promise<{ stdout: string; stderr: string; code: number | null; timedOut: boolean; unavailable: string | null }> {
-  const scopeArgs = ["--scope", scope, ...roDirs.flatMap((d) => ["--ro", d])];
-  return runShellCommand(SANDBOX_BIN, ["run", "--cwd", cwd, ...scopeArgs, "--", ...argv], cwd, timeoutMs).then((r) => ({
+  return runShellCommand(SANDBOX_BIN, ["run", "--cwd", cwd, "--scope", scope, "--", ...argv], cwd, timeoutMs).then((r) => ({
     ...r,
     unavailable: sandboxReason(r),
   }));
@@ -352,10 +350,10 @@ function createSystemTools(workspace: string) {
   const processStop = tool(
     async ({ pid, force }) => {
       if (!Number.isInteger(pid) || pid <= 0) return "PID 必须是正整数";
-      if (pid === process.pid) return "拒绝操作：不能终止 Mino 自身";
+      if (pid === process.pid) return "拒绝操作：不能终止 Kuriboh 自身";
       const entry = managedPids.get(pid);
       if (!entry)
-        return `进程 ${pid} 不是由 Mino 的 process_start 启动的，拒绝终止。可先用 run_command 查询确认（Windows 用 tasklist，macOS/Linux 用 ps）。`;
+        return `进程 ${pid} 不是由 Kuriboh 的 process_start 启动的，拒绝终止。可先用 run_command 查询确认（Windows 用 tasklist，macOS/Linux 用 ps）。`;
       try {
         // Unix：两条启动路径的进程都独立成组（pgid == pid），负 pid 组杀连子进程一起
         // 带走；Windows 无进程组概念，一律 TerminateProcess
@@ -374,7 +372,7 @@ function createSystemTools(workspace: string) {
     {
       name: "process_stop",
       description:
-        "终止 Mino 通过 process_start 启动的进程（传返回的 PID），默认温和终止，可选强制；Unix 上会连子进程整组终止。执行前会请用户确认。",
+        "终止 Kuriboh 通过 process_start 启动的进程（传返回的 PID），默认温和终止，可选强制；Unix 上会连子进程整组终止。执行前会请用户确认。",
       schema: z.object({
         pid: z.number().int().describe("要终止的进程 PID（process_start 返回值）"),
         force: z.boolean().optional().describe("可选，强制终止（Unix 用 SIGKILL），默认 false"),
@@ -451,13 +449,11 @@ const NOISE_DIRS = [
 
 // 跑一次 ripgrep（二进制随 @vscode/ripgrep 按平台安装），经 sidecar 在 OS 沙箱内
 // 执行（scope ro：搜索是读操作），收满 maxMatches 行即提前 kill，避免超大目录 /
-// 过宽模式拖垮搜索；30 秒超时兜底。extraRoDirs 是额外只读授权（仅 Windows 消费）：
-// rg 二进制目录恒带（AppContainer 内执行需读权限），grep 单文件模式再补目标本体
+// 过宽模式拖垮搜索；30 秒超时兜底
 function runRipgrep(
   args: string[],
   cwd: string,
-  maxMatches: number,
-  extraRoDirs: string[] = []
+  maxMatches: number
 ): Promise<{ lines: string[]; stderr: string; code: number | null; truncated: boolean; timedOut: boolean; unavailable: string | null }> {
   return new Promise((resolve) => {
     const child = spawn(
@@ -468,7 +464,6 @@ function runRipgrep(
         cwd,
         "--scope",
         "ro",
-        ...[path.dirname(rgPath), ...extraRoDirs].flatMap((d) => ["--ro", d]),
         "--",
         rgPath,
         ...args,
@@ -742,12 +737,11 @@ function createFileTools(workspace: string, permission: PermissionLevel) {
         } else {
           args.push("--", pattern, root); // 单文件显式指定，不受忽略规则与 glob 影响
         }
-        // 目录模式 cwd=根；单文件模式 cwd=工作区 + --ro 目标本体（Windows 读取授权）
+        // 目录模式 cwd=根；单文件模式 cwd=工作区
         const { lines, stderr, code, truncated, timedOut, unavailable: reason } = await runRipgrep(
           args,
           isDir ? root : workspace,
-          50,
-          isDir ? [] : [root]
+          50
         );
         if (reason) return sandboxUnavailable(reason);
         // rg 退出码：0 有匹配，1 无匹配，2 出错

@@ -81,7 +81,7 @@ if (local) {
     windows ? "junction" : "dir",
   );
 
-  const bin = windows ? "Mino.exe" : "Mino";
+  const bin = windows ? "Kuriboh.exe" : "Kuriboh";
   const result = spawnSync("go", ["build", "-ldflags", windows ? "-s -w -H windowsgui" : "-s -w", "-o", `../build/${bin}`, "."], {
     cwd: "launcher",
     stdio: "inherit",

@@ -1,12 +1,12 @@
-# L1 OS 沙箱（mino-sandbox）实施计划
+# L1 OS 沙箱（kuriboh-sandbox）实施计划
 
 ## Context
 
-System Tools（run_command / process_start / process_stop）目前直接在宿主机执行，仅靠逐次确认兜底。本计划引入 OS 级沙箱：命令在受限环境运行（**断网、全盘只读、仅工作区与私有 /tmp 可写；读取不限制在工作区——与 read_file 工具能力对齐，uid 权限照常生效**），沙箱不可用时自动回退「确认后宿主机执行」并在结果中标注。架构为 Node.js + Go Sandbox Runtime（经用户确认由 Rust 调整为 Go，复用仓库既有 Go 工具链与 CI setup-go）：Node 不再直接 spawn sh/powershell，改 spawn Go sidecar `mino-sandbox`，平台后端 Linux=bubblewrap、macOS=sandbox-exec（Seatbelt）、Windows=AppContainer。
+System Tools（run_command / process_start / process_stop）目前直接在宿主机执行，仅靠逐次确认兜底。本计划引入 OS 级沙箱：命令在受限环境运行（**断网、全盘只读、仅工作区与私有 /tmp 可写；读取不限制在工作区——与 read_file 工具能力对齐，uid 权限照常生效**），沙箱不可用时自动回退「确认后宿主机执行」并在结果中标注。架构为 Node.js + Go Sandbox Runtime（经用户确认由 Rust 调整为 Go，复用仓库既有 Go 工具链与 CI setup-go）：Node 不再直接 spawn sh/powershell，改 spawn Go sidecar `kuriboh-sandbox`，平台后端 Linux=bubblewrap、macOS=sandbox-exec（Seatbelt）、Windows=AppContainer。
 
 **已拍板决策**：
 1. 文件工具（read/write/glob/grep）留进程内走现有三级权限模型，不进沙箱。
-2. L1 范围：run_command、process_start 进沙箱；新增 `open_application`（宿主机、逐次确认）接管「打开桌面应用」；process_stop 加 PID 白名单（只允许终止 Mino 启动的进程）。
+2. L1 范围：run_command、process_start 进沙箱；新增 `open_application`（宿主机、逐次确认）接管「打开桌面应用」；process_stop 加 PID 白名单（只允许终止 Kuriboh 启动的进程）。
 3. run_command 沙箱默认断网；沙箱不可用 → 回退现有确认执行路径 + 标注。
 
 **本机已实证**（Ubuntu 26.04 + bwrap 0.11.1）：参数集经过两轮实测——首轮逐目录 bind 验证了可执行、断网、工作区可写、/etc 只读、进程列表可见、退出码透传；第二轮按「读取不限制在工作区内」的拍板改为 `--ro-bind / /` 全量只读，参数集简化且 merged-usr 坑自然消失。
@@ -27,9 +27,9 @@ System Tools（run_command / process_start / process_stop）目前直接在宿�
 
 ## Node ↔ Sidecar 契约
 
-- 二进制定位：`path.join(process.cwd(), "mino-sandbox" + (win32 ? ".exe" : ""))`（仿 web.ts 的 ROOT 模式；开发态 cwd=项目根，打包态 cwd=app 目录）。
+- 二进制定位：`path.join(process.cwd(), "kuriboh-sandbox" + (win32 ? ".exe" : ""))`（仿 web.ts 的 ROOT 模式；开发态 cwd=项目根，打包态 cwd=app 目录）。
 - 子命令：`probe` ｜ `run --cwd <p> -- <argv…>` ｜ `start --cwd <p> -- <argv…>`（run 也是 argv 数组：Node 侧把 shell argv 整体传入，沙箱内实际由 `sh -c` / `powershell -Command` 执行用户命令）。
-- **不可用判定（双保险）**：退出码 125 **且** stderr 首行 `MINO_SANDBOX_UNAVAILABLE: <原因>`（125 单独可能来自用户命令，不可仅凭退出码判断）。
+- **不可用判定（双保险）**：退出码 125 **且** stderr 首行 `KURIBOH_SANDBOX_UNAVAILABLE: <原因>`（125 单独可能来自用户命令，不可仅凭退出码判断）。
 - run 模式：sidecar 透传 stdio，以子进程退出码退出；start 模式：Unix 下 sidecar 首行输出 pgid 后退出（pid==pgid），Windows 输出 pid。
 
 ## 平台后端要点
@@ -60,8 +60,8 @@ bwrap --ro-bind / /  --dev /dev  --proc /proc  --tmpfs /tmp
 
 ## 文件改动清单
 
-**新建 `sandbox/`（Go module `mino/sandbox`，已落地；依赖 `golang.org/x/sys` v0.30.0，仅 windows.go 引用）**
-- `go.mod`：module mino/sandbox，go 1.21（与 launcher 一致，CI 复用同一 setup-go 工具链，无需新增）。
+**新建 `sandbox/`（Go module `kuriboh/sandbox`，已落地；依赖 `golang.org/x/sys` v0.30.0，仅 windows.go 引用）**
+- `go.mod`：module kuriboh/sandbox，go 1.21（与 launcher 一致，CI 复用同一 setup-go 工具链，无需新增）。
 - `main.go`：子命令解析、125+marker 统一出口；`unix.go`（`!windows` 构建标签）：`SysProcAttr{Setpgid}`、`signal.Notify` 组杀、`os.Getppid()==1` 孤儿兜底轮询、退出码透传（code 或 128+signal）；`linux.go` / `darwin.go` / `windows.go`（构建标签互斥）均已实现 probe/run/start（linux 实测全绿；darwin / windows 编译级验证，运行待真机手测）。
 
 **`src/tools.ts`（已落地并实测）**
@@ -74,15 +74,15 @@ bwrap --ro-bind / /  --dev /dev  --proc /proc  --tmpfs /tmp
 
 **`src/agent.ts`（已落地）**
 - `GATED_SYSTEM_TOOLS` 增加 `open_application`（verb「打开应用」，detail=target）。
-- 系统提示词：run_command / process_start 默认在 OS 沙箱内执行（断网、系统目录只读、仅当前工作区可写），沙箱不可用自动回退宿主机并在结果中标注；沙箱内跑不了 GUI 程序，打开应用用 open_application；process_stop 仅限 Mino 启动的进程。
+- 系统提示词：run_command / process_start 默认在 OS 沙箱内执行（断网、系统目录只读、仅当前工作区可写），沙箱不可用自动回退宿主机并在结果中标注；沙箱内跑不了 GUI 程序，打开应用用 open_application；process_stop 仅限 Kuriboh 启动的进程。
 
 **构建 / CI（已落地）**
 - `package.json`：+`"build:sandbox"`（`node sandbox/build.mjs`：go build + 复制二进制到项目根，Windows 加 `.exe`，供 `npm start` 开发态用）。
-- `.github/workflows/build.yml`：`npm run build` 内先跑 `sandbox/build.mjs`（Build app bundle 步骤，runner 本机平台编出 `mino-sandbox(.exe)` 到仓库根，复用既有 setup-go）；packaging 三平台分支各加一行 cp 进 app 目录（launcher 以 app 目录为 node 进程 cwd，`process.cwd()` 定位要求二者同目录）。
-- `.gitignore`：+`/mino-sandbox`、`/mino-sandbox.exe`，以及 sandbox/ 内 `go build .` 的散落产物 `/sandbox/sandbox`、`/sandbox/sandbox.exe`。
+- `.github/workflows/build.yml`：`npm run build` 内先跑 `sandbox/build.mjs`（Build app bundle 步骤，runner 本机平台编出 `kuriboh-sandbox(.exe)` 到仓库根，复用既有 setup-go）；packaging 三平台分支各加一行 cp 进 app 目录（launcher 以 app 目录为 node 进程 cwd，`process.cwd()` 定位要求二者同目录）。
+- `.gitignore`：+`/kuriboh-sandbox`、`/kuriboh-sandbox.exe`，以及 sandbox/ 内 `go build .` 的散落产物 `/sandbox/sandbox`、`/sandbox/sandbox.exe`。
 
 **文档**
-- `AGENTS.md`：目录职责加 `sandbox/`；红线 4 补（沙箱语义、回退、open_application、process_stop 白名单）；红线 8 补 Go sidecar（mino-sandbox 二进制）staging；运行与验证补 build:sandbox。
+- `AGENTS.md`：目录职责加 `sandbox/`；红线 4 补（沙箱语义、回退、open_application、process_stop 白名单）；红线 8 补 Go sidecar（kuriboh-sandbox 二进制）staging；运行与验证补 build:sandbox。
 - `README.md`：依赖表加 Linux bubblewrap（可选，缺失自动回退）。
 
 ## 验证

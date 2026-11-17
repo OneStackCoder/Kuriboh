@@ -99,7 +99,7 @@ func sandboxProbe() error {
 	return nil
 }
 
-func sandboxRun(cwd, scope string, roDirs []string, argv []string) error {
+func sandboxRun(cwd, scope string, argv []string) error {
 	if scope == "home" {
 		// home 档放行 $HOME，缺失/无效时明确报沙箱不可用而不是让命令在 profile 内静默被拒
 		home := os.Getenv("HOME")
@@ -111,8 +111,7 @@ func sandboxRun(cwd, scope string, roDirs []string, argv []string) error {
 		}
 	}
 	// runAndWait 在正常路径透传子命令退出码后 os.Exit，不返回；
-	// spawn 失败走 unavailable 出口。
-	// roDirs 忽略：(allow default) 读取已全盘放行，无需逐路径授权
+	// spawn 失败走 unavailable 出口
 	runAndWait(sandboxExecCommand(cwd, scope, argv))
 	return nil
 }
