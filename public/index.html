@@ -695,7 +695,7 @@
     display: flex; align-items: center; justify-content: center;
   }
   .about-head { display: flex; align-items: center; gap: 14px; }
-  .about-logo { width: 56px; height: 56px; flex: none; }
+  .about-logo { width: 86px; height: 86px; flex: none; background-color: #ffffff; }
   .about-name { font-size: 20px; font-weight: 700; color: var(--text); line-height: 1.2; }
   .about-desc { font-size: 13px; color: var(--text-2); line-height: 1.7; margin: 4px 0 0; }
   .about-link {
@@ -1031,41 +1031,13 @@
     </div>
     <div class="tab-panel" data-panel="about" hidden>
       <div class="about-head">
-        <svg class="about-logo" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <defs>
-            <linearGradient id="aboutLogoBg" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stop-color="#303036" />
-              <stop offset="1" stop-color="#141417" />
-            </linearGradient>
-            <linearGradient id="aboutLogoGlow" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stop-color="#ffffff" stop-opacity="0.10" />
-              <stop offset="1" stop-color="#ffffff" stop-opacity="0" />
-            </linearGradient>
-            <clipPath id="aboutLogoBody">
-              <rect x="84" y="84" width="856" height="856" rx="190" />
-            </clipPath>
-          </defs>
-          <rect x="84" y="84" width="856" height="856" rx="190" fill="url(#aboutLogoBg)" />
-          <g clip-path="url(#aboutLogoBody)">
-            <ellipse cx="512" cy="120" rx="760" ry="440" fill="url(#aboutLogoGlow)" />
-          </g>
-          <g fill="none" stroke="#F6F2E9" stroke-width="96">
-            <path d="M290 541 A111 111 0 0 1 512 541" />
-            <path d="M512 541 A111 111 0 0 1 734 541" />
-          </g>
-          <g fill="#F6F2E9">
-            <path d="M242 541 V682 a48 48 0 0 0 96 0 V541 Z" />
-            <path d="M464 541 V682 a48 48 0 0 0 96 0 V541 Z" />
-            <path d="M686 541 V682 a48 48 0 0 0 96 0 V541 Z" />
-          </g>
-          <circle cx="512" cy="296" r="48" fill="#E8573F" />
-        </svg>
+        <img class="about-logo" src="logo.png" alt="logo" aria-hidden="true">
         <div>
-          <div class="about-name">Mino</div>
+          <div class="about-name">Kuriboh</div>
           <p class="about-desc">一个在本机运行的桌面 AI Agent，界面、模型与对话数据都留在你自己的电脑上。</p>
         </div>
       </div>
-      <a class="about-link" id="aboutRepoLink" href="https://github.com/OneStackCoder/Muji">https://github.com/OneStackCoder/Muji</a>
+      <a class="about-link" id="aboutRepoLink" href="https://github.com/OneStackCoder/Kuriboh">Github</a>
     </div>
       </div>
     </div>

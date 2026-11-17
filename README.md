@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/icon.svg" alt="Mino logo" width="96">
+  <img src="assets/icon.svg" alt="Kuriboh logo" width="200">
 </p>
 
-# Mino
+# Kuriboh
 
-<img src="screenshot.png" alt="Mino 截图" width="720">
+<img src="screenshot.png" alt="Kuriboh 截图" width="720">
 
 基于 LangChain.js 的桌面 AI Agent：原生 webview 窗口，轻量无 Electron，启动即用。Node.js ≥ 24 直接运行 ，零构建步骤。
 
@@ -30,7 +30,8 @@ Debian / Ubuntu 安装示例（包名因发行版而异）：
 sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux bubblewrap
 ```
 
-系统命令（run_command / process_start）与文件读写搜索（read_file / write_file / edit_file / list_directory / glob_search / grep_search）默认在 OS 沙箱内执行（断网、系统目录只读、写入仅限工作区、用户主目录与临时目录）：Linux 依赖 `bubblewrap`，内核 ≥ 5.13 时自动叠加 Landlock 第二道写入防线（无需安装）；Windows 使用系统内置 AppContainer，macOS 使用系统自带 sandbox-exec，均无需额外依赖。沙箱不可用时命令自动回退宿主机执行并在结果中标注；文件工具则直接报错停用、不回退。经用户确认的工作区外写入也仍被沙箱限制在用户主目录与临时目录内。系统命令与进程操作在「仅可查看」「工作区内」权限下逐次弹卡确认，「完全权限」下免确认直接执行；其中 run_command 的纯只读查询命令（Linux/macOS 下 uname、ps、df、cat、sw_vers、system_profiler 等，Windows 下 systeminfo、tasklist、Get-Process、dir 等，且不含命令替换 / 子 shell / 写文件重定向）任意权限下都直接执行；for / while / if 等复合命令会做语法分析，条件与循环体内全部为只读查询时同样直接执行。沙箱的技术原理、平台实现与安全边界详见 [README-sandbox.md](README-sandbox.md)。
+### 沙箱安全
+沙箱的技术原理、平台实现与安全边界详见 [README-sandbox.md](README-sandbox.md)。
 
 ## 运行
 
@@ -56,10 +57,10 @@ npm run build:local      # 编译 mino-sandbox sidecar，打包到 build/app，�
 | Claude Code           | 接近上限自动压缩（约 92%），`/compact` 手动压缩；配合工具输出截断、子代理隔离                          |
 | Cursor                | `/compact` 手动摘要；接近上限时自动浓缩旧对话                                            |
 | Cline / Roo Code      | 滑动窗口截断 ＋ auto-compact 把历史浓缩成摘要后开新上下文                                    |
-| LangChain / LangGraph | `trimMessages` 滑窗截断；`summarizationMiddleware` 摘要压缩（Mino 在用）             |
-| **Mino（本项目）**         | `summarizationMiddleware`：token 估算 ≥ 16,000 触发，旧消息 → 一条摘要，保留最近 20 条，全自动 |
+| LangChain / LangGraph | `trimMessages` 滑窗截断；`summarizationMiddleware` 摘要压缩（Kuriboh 在用）             |
+| **Kuriboh（本项目）**         | `summarizationMiddleware`：token 估算 ≥ 16,000 触发，旧消息 → 一条摘要，保留最近 20 条，全自动 |
 
-### Mino 的实现
+### Kuriboh 的实现
 
 配置在 [src/agent.ts](src/agent.ts)：
 

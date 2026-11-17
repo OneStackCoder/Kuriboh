@@ -43,6 +43,7 @@ const ROOT = process.cwd();
 const INDEX_FILE = path.join(ROOT, "public", "index.html");
 // 固定映射表，不开放任意路径读取（防目录穿越）
 const VENDOR: Record<string, readonly [string, string]> = {
+  "/logo.png": [path.join(ROOT, "public", "logo.png"), "image/png"],
   "/vendor/marked.js": [
     path.join(ROOT, "node_modules", "marked", "lib", "marked.umd.js"),
     "application/javascript; charset=utf-8",
