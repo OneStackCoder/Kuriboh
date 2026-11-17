@@ -7,7 +7,6 @@ import { JSDOM, VirtualConsole } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import { tool } from "langchain";
 import { z } from "zod";
-import { globby } from "globby";
 import { rgPath } from "@vscode/ripgrep";
 import type {
   AgentConfig,
@@ -15,7 +14,7 @@ import type {
   SearchSettings,
 } from "./config.ts";
 
-// ---------- 工具集：计算 / 文件操作（按工作区构建）/ 信息检索 ----------
+// ---------- 工具集：计算 / 文件操作（按工作区构建）/ 信息检索 / 系统工具 ----------
 // agent.ts 通过 `import { createTools } from "./tools.ts"` 装配；新增工具在本文件追加即可。
 // 工具结果统一返回字符串（前端 web.ts 的 tool_result 渲染直接展示）。
 
@@ -65,6 +64,354 @@ const getCurrentTime = tool(
   }
 );
 
+// ========== 系统工具：命令执行与进程管理 ==========
+// 不属于文件权限模型：agent.ts 中对这几个工具单独配置 humanInTheLoopMiddleware，
+// 无论权限级别如何，每次执行前都会先请用户确认。
+// run_command / process_start 优先在 OS 沙箱内执行（sidecar 是 sandbox/ 编出的
+// mino-sandbox：断网、系统只读、仅工作区可写），沙箱未建立时回退宿主机执行；
+// open_application 面向 GUI（沙箱内无显示服务），只在宿主机执行。
+
+// sidecar 位置：开发态由 build:sandbox 产出在项目根，打包态由 CI 复制进应用目录
+const SANDBOX_BIN = path.join(
+  process.cwd(),
+  `mino-sandbox${process.platform === "win32" ? ".exe" : ""}`
+);
+// 「沙箱不可用」判定契约：退出码 125 且 stderr 首行为 marker，两者同时成立才可信
+//（用户命令也可能恰好退出 125）
+const SANDBOX_EXIT = 125;
+const SANDBOX_MARKER = "MINO_SANDBOX_UNAVAILABLE:";
+
+// 可用性探测结果缓存到进程退出：不可用（sidecar 缺失 / 探测超时 / 非零退出）
+// 时不反复探测。缓存带原因：run_command/process_start 回退时只判 ok，
+// 文件工具硬失败时要把原因展示给用户
+let sandboxProbe: Promise<{ ok: boolean; reason: string | null }> | null = null;
+function isSandboxAvailable(): Promise<{ ok: boolean; reason: string | null }> {
+  sandboxProbe ??= new Promise((resolve) => {
+    const child = spawn(SANDBOX_BIN, ["probe"], {
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe"],
+      signal: AbortSignal.timeout(5000),
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length < 400) stderr += chunk.toString();
+    });
+    const fail = (reason: string) => resolve({ ok: false, reason });
+    child.on("error", (err) => {
+      fail(
+        (err as NodeJS.ErrnoException).name === "AbortError"
+          ? "探测超时"
+          : "sidecar 缺失，请先运行 npm run build:sandbox"
+      );
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ ok: true, reason: null });
+        return;
+      }
+      // probe 失败同样走 125+marker 契约，剥出 sidecar 给的具体原因
+      const first = stderr.split("\n")[0] ?? "";
+      const marked = first.startsWith(SANDBOX_MARKER) ? first.slice(SANDBOX_MARKER.length).trim() : "";
+      fail(marked || `探测失败（退出码 ${code}）`);
+    });
+  });
+  return sandboxProbe;
+}
+
+// 从执行结果提取「沙箱未建立」的原因；非 null 即调用方需回退宿主机执行
+function sandboxReason(r: { stderr: string; code: number | null }): string | null {
+  const first = r.stderr.split("\n")[0] ?? "";
+  return r.code === SANDBOX_EXIT && first.startsWith(SANDBOX_MARKER)
+    ? first.slice(SANDBOX_MARKER.length).trim()
+    : null;
+}
+
+// 跑一个子进程并等待结束：沙箱执行（spawn sidecar）与宿主回退共用，差别只在 file/argv。
+// 输出用 Buffer 聚合、按字节设上限（多字节字符跨 chunk 不会被截成 U+FFFD），
+// 结束时统一转字符串；cap 防止 yes 这类命令吃内存，展示前再截断
+function runShellCommand(
+  file: string,
+  argv: string[],
+  cwd: string,
+  timeoutMs: number,
+  opts?: { stdin?: string; cap?: number }
+): Promise<{ stdout: string; stderr: string; code: number | null; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    const CAP = opts?.cap ?? 200_000;
+    const child = spawn(file, argv, {
+      cwd,
+      windowsHide: true,
+      stdio: [opts?.stdin !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (opts?.stdin !== undefined) {
+      child.stdin?.on("error", () => {}); // EPIPE：对端不等输入就退出属正常，静默
+      child.stdin?.end(opts.stdin);
+    }
+    const capped = (cap: number) => {
+      const bufs: Buffer[] = [];
+      let len = 0;
+      return {
+        push(chunk: Buffer) {
+          if (len >= cap) return;
+          const take = Math.min(chunk.length, cap - len);
+          bufs.push(take === chunk.length ? chunk : chunk.subarray(0, take));
+          len += take;
+        },
+        text: () => Buffer.concat(bufs).toString(),
+      };
+    };
+    const out = capped(CAP);
+    const err = capped(CAP);
+    let errText = ""; // spawn error 的补充消息，拼在子进程 stderr 末尾
+    let timedOut = false;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      const stderr = err.text() + (errText ? "\n" + errText : "");
+      resolve({ stdout: out.text(), stderr, code: child.exitCode, timedOut });
+    };
+    child.stdout?.on("data", (chunk: Buffer) => out.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
+    child.on("error", (err) => {
+      // signal 超时触发 AbortError，随后 close 收尾
+      if ((err as NodeJS.ErrnoException).name === "AbortError") timedOut = true;
+      else if (!errText) errText = (err as Error).message;
+      finish();
+    });
+    child.on("close", finish);
+  });
+}
+
+type SandboxScope = "ro" | "ws" | "home";
+
+// 沙箱内执行用户命令（sidecar run 子命令），结果附 unavailable 原因。
+// scope 三档与 roDirs 只读授权由文件/搜索工具消费；run_command 不传维持 ws 现语义
+function runInSandbox(
+  argv: string[],
+  cwd: string,
+  timeoutMs: number,
+  scope: SandboxScope = "ws",
+  roDirs: string[] = []
+): Promise<{ stdout: string; stderr: string; code: number | null; timedOut: boolean; unavailable: string | null }> {
+  const scopeArgs = ["--scope", scope, ...roDirs.flatMap((d) => ["--ro", d])];
+  return runShellCommand(SANDBOX_BIN, ["run", "--cwd", cwd, ...scopeArgs, "--", ...argv], cwd, timeoutMs).then((r) => ({
+    ...r,
+    unavailable: sandboxReason(r),
+  }));
+}
+
+// 文件工具的沙箱硬失败语义：不可用一律拒绝执行并展示原因——
+// 与 run_command 的回退宿主机刻意不同（写路径宁可失败不可越权）
+const sandboxUnavailable = (reason: string | null) =>
+  `OS 沙箱不可用（${reason || "未知原因"}）。文件工具仅在沙箱内执行，已拒绝操作。修复：npm run build:sandbox；Linux 需安装 bubblewrap`;
+
+async function ensureSandbox(): Promise<string | null> {
+  const probe = await isSandboxAvailable();
+  return probe.ok ? null : sandboxUnavailable(probe.reason);
+}
+
+// 文件操作统一走 sidecar fs 子命令：125+marker 是沙箱未建立，返回原因由
+// 调用方直接拒绝（不回退）；code 非 0 是操作本身失败，调用方展示 stderr 首行
+async function runFsOp(
+  sub: "read" | "write" | "list",
+  cwd: string,
+  scope: SandboxScope,
+  target: string,
+  stdin?: string,
+  cap?: number
+): Promise<
+  | { ok: true; stdout: string; stderr: string; code: number | null; timedOut: boolean }
+  | { ok: false; reason: string }
+> {
+  const r = await runShellCommand(
+    SANDBOX_BIN,
+    ["fs", sub, "--cwd", cwd, "--scope", scope, "--", target],
+    cwd,
+    30_000,
+    { stdin, cap }
+  );
+  const reason = sandboxReason(r);
+  if (reason !== null) return { ok: false, reason };
+  if (r.timedOut) return { ok: false, reason: "文件操作超时（30 秒）" };
+  return { ok: true, ...r };
+}
+
+// 用户命令 → shell argv（沙箱与宿主回退共用同一套，保证两条路径行为一致）。
+// Windows 走 PowerShell：中文管道默认 GBK，先切 UTF-8 再执行用户命令；其余平台 sh -c
+function shellArgv(command: string): { file: string; argv: string[] } {
+  if (process.platform === "win32") {
+    return {
+      file: "powershell.exe",
+      argv: [
+        "-NoLogo",
+        "-NonInteractive",
+        "-Command",
+        `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ${command}`,
+      ],
+    };
+  }
+  return { file: "/bin/sh", argv: ["-c", command] };
+}
+
+// 宿主机启动独立进程（process_start 回退、open_application 共用）：
+// detached 独立进程组（Unix 下 pid 即 pgid，可组杀）、不占管道、unref 脱离事件循环
+function spawnDetached(file: string, argv: string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, argv, { detached: true, stdio: "ignore" });
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref(); // 脱离父进程事件循环：程序独立运行，不阻塞 Agent
+      resolve(child.pid!);
+    });
+  });
+}
+
+// process_start 登记表（模块级，agent 重建不清空）：沙箱路径登记 pgid（Unix）/ pid
+//（Windows），宿主回退登记 pid。process_stop 只终止表内进程，ESRCH 时清除登记
+const managedPids = new Map<number, { command: string; time: number }>();
+
+// 工厂：系统工具按工作区构建（run_command 默认在工作区目录下执行）
+function createSystemTools(workspace: string) {
+  const runCommand = tool(
+    async ({ command, timeoutMs }) => {
+      const timeout = Math.min(Math.max(timeoutMs ?? 30_000, 1_000), 120_000);
+      const clip = (label: string, text: string): string =>
+        text ? `\n${label}：\n${text.length > 8000 ? text.slice(0, 8000) + `\n…（已截断，共 ${text.length} 字符）` : text}` : "";
+      const format = (r: { stdout: string; stderr: string; code: number | null; timedOut: boolean }) => {
+        const head = r.timedOut ? `命令超时（${timeout / 1000} 秒），已终止` : `退出码：${r.code}`;
+        const body = clip("标准输出", r.stdout) + clip("标准错误", r.stderr);
+        return body ? `${head}${body}` : `${head}\n（无输出）`;
+      };
+      const shell = shellArgv(command);
+      // 沙箱优先；未建立（125+marker）才回退宿主机直接执行并标注——
+      // 命令本身已在 humanInTheLoopMiddleware 确认过，回退不追加二次确认
+      if ((await isSandboxAvailable()).ok) {
+        const r = await runInSandbox([shell.file, ...shell.argv], workspace, timeout);
+        if (r.unavailable === null) return format(r);
+        const host = await runShellCommand(shell.file, shell.argv, workspace, timeout);
+        return `（沙箱不可用：${r.unavailable}；以下为宿主机直接执行的结果）\n${format(host)}`;
+      }
+      // sidecar 缺失或探测失败：沿用宿主机直接执行（与沙箱引入前行为一致）
+      const host = await runShellCommand(shell.file, shell.argv, workspace, timeout);
+      return format(host);
+    },
+    {
+      name: "run_command",
+      description:
+        "执行一条系统命令并返回输出（Windows 为 PowerShell，macOS/Linux 为 sh）。默认在 OS 沙箱内执行：断网、系统目录只读、仅当前工作区可写；沙箱不可用时自动改在宿主机执行并在结果中标注。用于查询系统状态（CPU、内存、磁盘、网络、进程列表等）或运行脚本；默认 30 秒超时，输出超长会截断。纯只读查询命令（uname、ps、df、cat 等）直接执行；修改类命令执行前会请用户确认（「完全权限」模式下免确认）。",
+      schema: z.object({
+        command: z.string().describe("要执行的命令"),
+        timeoutMs: z.number().int().optional().describe("可选，超时毫秒数，默认 30000，范围 1000-120000"),
+      }),
+    }
+  );
+
+  const processStart = tool(
+    async ({ command, args }) => {
+      const label = `${command}${args?.length ? " " + args.join(" ") : ""}`;
+      // 沙箱 start：sidecar 在沙箱内启动进程，首行打印 pgid（Unix）/ pid（Windows）后
+      // 即退出；sidecar 无长驻逻辑，5 秒足够拿到 PID
+      if ((await isSandboxAvailable()).ok) {
+        const r = await runShellCommand(
+          SANDBOX_BIN,
+          ["start", "--cwd", workspace, "--", command, ...(args ?? [])],
+          workspace,
+          5000
+        );
+        if (sandboxReason(r) === null) {
+          const pid = Number.parseInt(r.stdout.trim().split("\n")[0] ?? "", 10);
+          if (Number.isInteger(pid) && pid > 0) {
+            managedPids.set(pid, { command: label, time: Date.now() });
+            return `已在沙箱内启动 ${label}（PID ${pid}）`;
+          }
+          return `启动失败：${r.stderr.trim().split("\n")[0] || "sidecar 未返回 PID"}`;
+        }
+        // 沙箱未建立（如命令在沙箱内不存在）：回退宿主机启动，行为与下方的直接路径一致
+      }
+      try {
+        const pid = await spawnDetached(command, args ?? []);
+        managedPids.set(pid, { command: label, time: Date.now() });
+        return `已启动 ${label}（PID ${pid}）`;
+      } catch (err) {
+        return `启动失败：${(err as Error).message}`;
+      }
+    },
+    {
+      name: "process_start",
+      description:
+        "启动一个独立运行的进程（如跑后台服务、命令行程序），立即返回 PID，不等待结束、不捕获输出；默认在沙箱内启动，沙箱不可用时在宿主机启动。需要带参数时用 args 逐个传入；打开 GUI 应用、文件或网址请改用 open_application。执行前会请用户确认。",
+      schema: z.object({
+        command: z.string().describe("可执行文件或命令，如 /usr/bin/python3、node"),
+        args: z.array(z.string()).optional().describe("可选，传给进程的参数列表"),
+      }),
+    }
+  );
+
+  const processStop = tool(
+    async ({ pid, force }) => {
+      if (!Number.isInteger(pid) || pid <= 0) return "PID 必须是正整数";
+      if (pid === process.pid) return "拒绝操作：不能终止 Mino 自身";
+      const entry = managedPids.get(pid);
+      if (!entry)
+        return `进程 ${pid} 不是由 Mino 的 process_start 启动的，拒绝终止。可先用 run_command 查询确认（Windows 用 tasklist，macOS/Linux 用 ps）。`;
+      try {
+        // Unix：两条启动路径的进程都独立成组（pgid == pid），负 pid 组杀连子进程一起
+        // 带走；Windows 无进程组概念，一律 TerminateProcess
+        process.kill(process.platform === "win32" ? pid : -pid, force ? "SIGKILL" : "SIGTERM");
+        managedPids.delete(pid);
+        return `已向 ${entry.command}（PID ${pid}）发送${force ? "强制" : ""}终止信号`;
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        if (e.code === "ESRCH") {
+          managedPids.delete(pid);
+          return `进程 ${pid} 不存在或已退出（已从登记表清除）`;
+        }
+        return `终止失败：${e.message}`;
+      }
+    },
+    {
+      name: "process_stop",
+      description:
+        "终止 Mino 通过 process_start 启动的进程（传返回的 PID），默认温和终止，可选强制；Unix 上会连子进程整组终止。执行前会请用户确认。",
+      schema: z.object({
+        pid: z.number().int().describe("要终止的进程 PID（process_start 返回值）"),
+        force: z.boolean().optional().describe("可选，强制终止（Unix 用 SIGKILL），默认 false"),
+      }),
+    }
+  );
+
+  // 打开应用 / 文件 / URL：GUI 程序在沙箱内起不来（无显示服务），只能宿主机执行；
+  // 不登记 PID——桌面程序交给用户自己管理，process_stop 不应杀它们
+  const openApplication = tool(
+    async ({ target }) => {
+      const argv =
+        process.platform === "win32"
+          ? ["cmd", "/c", "start", "", target] // start 的首个引号参数是窗口标题占位，缺省会被 target 占用
+          : process.platform === "darwin"
+            ? ["open", target]
+            : ["xdg-open", target];
+      try {
+        await spawnDetached(argv[0], argv.slice(1));
+        return `已打开 ${target}`;
+      } catch (err) {
+        return `打开失败：${(err as Error).message}`;
+      }
+    },
+    {
+      name: "open_application",
+      description:
+        "在用户桌面打开应用程序、文件或网址（用系统默认方式打开；宿主机执行，不经过沙箱），如打开计算器、用默认编辑器打开文档、用默认浏览器打开 URL。执行前会请用户确认。",
+      schema: z.object({
+        target: z.string().describe("应用名、文件路径或 URL，如 calc、/home/user/doc.pdf、https://example.com"),
+      }),
+    }
+  );
+
+  return [runCommand, processStart, processStop, openApplication];
+}
+
 // ========== 文件操作类（按权限模式管控） ==========
 // 相对路径以工作区为基准解析；工具本身可访问任意绝对路径，
 // 是否需要用户确认由 agent.ts 的 humanInTheLoopMiddleware 按权限级别拦截。
@@ -93,7 +440,7 @@ export function needsConfirm(
   return true;
 }
 
-// ========== 文件搜索：glob 按路径找文件（globby）、grep 按内容找文本（ripgrep），均为读取，免确认 ==========
+// ========== 文件搜索：glob 按路径找文件、grep 按内容找文本（统一用捆绑 ripgrep、经 sidecar 沙箱执行），均为读取，免确认 ==========
 
 // 搜索时跳过的目录：依赖、构建产物与缓存，体量大且几乎不含用户要找的内容
 const NOISE_DIRS = [
@@ -101,23 +448,39 @@ const NOISE_DIRS = [
   "dist", "build", "out", ".next", ".nuxt", "coverage",
   "__pycache__", ".venv", "venv", ".cache", ".idea", ".vscode",
 ];
-const NOISE_IGNORE = NOISE_DIRS.map((dir) => `**/${dir}/**`);
 
-// 跑一次 ripgrep（二进制随 @vscode/ripgrep 按平台安装），收满 maxMatches 行即提前 kill，
-// 避免超大目录 / 过宽模式拖垮搜索；30 秒超时兜底
+// 跑一次 ripgrep（二进制随 @vscode/ripgrep 按平台安装），经 sidecar 在 OS 沙箱内
+// 执行（scope ro：搜索是读操作），收满 maxMatches 行即提前 kill，避免超大目录 /
+// 过宽模式拖垮搜索；30 秒超时兜底。extraRoDirs 是额外只读授权（仅 Windows 消费）：
+// rg 二进制目录恒带（AppContainer 内执行需读权限），grep 单文件模式再补目标本体
 function runRipgrep(
   args: string[],
   cwd: string,
-  maxMatches: number
-): Promise<{ lines: string[]; stderr: string; code: number | null; truncated: boolean; timedOut: boolean }> {
+  maxMatches: number,
+  extraRoDirs: string[] = []
+): Promise<{ lines: string[]; stderr: string; code: number | null; truncated: boolean; timedOut: boolean; unavailable: string | null }> {
   return new Promise((resolve) => {
-    const child = spawn(rgPath, args, {
-      cwd,
-      windowsHide: true,
-      // stdin 必须 ignore：目录搜索不传路径参数，rg 检测到 stdin 是未关闭的管道时会改为等待读取 stdin
-      stdio: ["ignore", "pipe", "pipe"],
-      signal: AbortSignal.timeout(30_000),
-    });
+    const child = spawn(
+      SANDBOX_BIN,
+      [
+        "run",
+        "--cwd",
+        cwd,
+        "--scope",
+        "ro",
+        ...[path.dirname(rgPath), ...extraRoDirs].flatMap((d) => ["--ro", d]),
+        "--",
+        rgPath,
+        ...args,
+      ],
+      {
+        cwd,
+        windowsHide: true,
+        // stdin 必须 ignore：目录搜索不传路径参数，rg 检测到 stdin 是未关闭的管道时会改为等待读取 stdin
+        stdio: ["ignore", "pipe", "pipe"],
+        signal: AbortSignal.timeout(30_000),
+      }
+    );
     const lines: string[] = [];
     let stderr = "";
     let partial = "";
@@ -127,7 +490,14 @@ function runRipgrep(
     const finish = () => {
       if (settled) return;
       settled = true;
-      resolve({ lines, stderr, code: child.exitCode, truncated, timedOut });
+      resolve({
+        lines,
+        stderr,
+        code: child.exitCode,
+        truncated,
+        timedOut,
+        unavailable: sandboxReason({ stderr, code: child.exitCode }),
+      });
     };
     child.stdout.on("data", (chunk: Buffer) => {
       partial += chunk.toString();
@@ -157,20 +527,22 @@ function runRipgrep(
   });
 }
 
-// 工厂：文件工具按工作区目录构建（切换工作区时由 web.ts 重建 agent 重新装配）
-function createFileTools(workspace: string) {
-  // 工具：读文件
+// 工厂：文件工具按工作区目录构建（切换工作区时由 web.ts 重建 agent 重新装配）。
+// 五个文件工具一律经 sidecar 在 OS 沙箱内执行，沙箱不可用硬失败不回退
+function createFileTools(workspace: string, permission: PermissionLevel) {
+  // 工具：读文件（OS 沙箱 ro 档：全盘只读，读取不受工作区限制）
   const readFileTool = tool(
     async ({ path: file }) => {
-      try {
-        const target = resolveWorkspacePath(workspace, file).path;
-        const content = fs.readFileSync(target, "utf-8");
-        return content.length > 20000
-          ? content.slice(0, 20000) + `\n…（内容过长已截断，全文共 ${content.length} 字符）`
-          : content || "(空文件)";
-      } catch (err) {
-        return `读取失败：${(err as Error).message}`;
-      }
+      const target = resolveWorkspacePath(workspace, file).path;
+      const unavailable = await ensureSandbox();
+      if (unavailable) return unavailable;
+      const r = await runFsOp("read", workspace, "ro", target, undefined, 1_000_000);
+      if (!r.ok) return `读取失败：${r.reason}`;
+      if (r.code !== 0) return `读取失败：${r.stderr.split("\n")[0] || `退出码 ${r.code}`}`;
+      const content = r.stdout;
+      return content.length > 20000
+        ? content.slice(0, 20000) + `\n…（内容过长已截断，全文共 ${content.length} 字符）`
+        : content || "(空文件)";
     },
     {
       name: "read_file",
@@ -182,17 +554,19 @@ function createFileTools(workspace: string) {
     }
   );
 
-  // 工具：写文件
+  // 工具：写文件（写入 containment 由沙箱 OS 档位硬性保证，父目录不存在自动创建）
   const writeFileTool = tool(
     async ({ path: file, content }) => {
-      try {
-        const target = resolveWorkspacePath(workspace, file).path;
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.writeFileSync(target, content, "utf-8");
-        return `已写入 ${target}（${content.length} 字符）`;
-      } catch (err) {
-        return `写入失败：${(err as Error).message}`;
-      }
+      const { path: target, inside } = resolveWorkspacePath(workspace, file);
+      const unavailable = await ensureSandbox();
+      if (unavailable) return unavailable;
+      // 写权限面：full 恒 home 档；readonly/workspace 级区内写 ws 档——能执行到
+      // 区外写说明已被 humanInTheLoopMiddleware 确认过，升级 home 档保留现有能力矩阵
+      const scope: SandboxScope = permission === "full" ? "home" : inside ? "ws" : "home";
+      const r = await runFsOp("write", workspace, scope, target, content);
+      if (!r.ok) return `写入失败：${r.reason}`;
+      if (r.code !== 0) return `写入失败：${r.stderr.split("\n")[0] || `退出码 ${r.code}`}`;
+      return `已写入 ${target}（${content.length} 字符）`;
     },
     {
       name: "write_file",
@@ -205,30 +579,72 @@ function createFileTools(workspace: string) {
     }
   );
 
-  // 工具：列目录
+  // 工具：增量修改——read_file + write_file 的组合，不重写整个文件，只替换命中的片段。
+  // 读走 ro 档，写回按 write_file 同一 scope 判定，替换在 Node 内存完成
+  const editFile = tool(
+    async ({ path: file, old_string, new_string, replace_all }) => {
+      if (!old_string) return "修改失败：old_string 不能为空；新建文件请用 write_file。";
+      if (old_string === new_string) return "修改失败：old_string 与 new_string 相同，无需修改。";
+      const unavailable = await ensureSandbox();
+      if (unavailable) return unavailable;
+      const { path: target, inside } = resolveWorkspacePath(workspace, file);
+      const r = await runFsOp("read", workspace, "ro", target, undefined, 1_000_000);
+      if (!r.ok) return `修改失败：${r.reason}`;
+      if (r.code !== 0) return `修改失败：${r.stderr.split("\n")[0] || `退出码 ${r.code}`}`;
+      // 读到上限字节的文件可能已被截断，替换截断内容再写回会静默丢掉文件尾部，一律拒绝
+      if (Buffer.byteLength(r.stdout) >= 1_000_000)
+        return "修改失败：文件超出 100 万字节上限，不适合增量修改；请用 read_file 分段读取后用 write_file 重写。";
+      const content = r.stdout;
+      const count = content.split(old_string).length - 1;
+      if (count === 0)
+        return "修改失败：文件中未找到 old_string。请核对片段与文件实际内容是否逐字符一致（缩进、制表符、行尾空白都算差异），或先用 read_file 查看目标位置附近内容。";
+      if (count > 1 && !replace_all)
+        return `修改失败：old_string 在文件中出现 ${count} 次，不唯一。请扩大片段范围（多带一行上下文）使其唯一，或传 replace_all: true 全部替换。`;
+      // split/join 是字面拼接：replace 的字符串 replacement 会解释 $& 等特殊模式，不能用
+      const updated = content.split(old_string).join(new_string);
+      const scope = permission === "full" ? "home" : inside ? "ws" : "home";
+      const w = await runFsOp("write", workspace, scope, target, updated);
+      if (!w.ok) return `修改失败：${w.reason}`;
+      if (w.code !== 0) return `修改失败：${w.stderr.split("\n")[0] || `退出码 ${w.code}`}`;
+      return `已修改 ${target}：替换 ${replace_all ? count : 1} 处，文件现为 ${updated.length} 字符。`;
+    },
+    {
+      name: "edit_file",
+      description:
+        "增量修改：把已有文件中精确匹配 old_string 的文本替换为 new_string，文件其余部分原样保留。old_string 必须与文件内容逐字符一致（含缩进与空白），默认要求在文件中唯一出现，相同片段出现多处需传 replace_all: true。未命中或文件不存在会报错；新建文件请用 write_file。",
+      schema: z.object({
+        path: z.string().describe("文件路径，相对当前工作区或绝对路径"),
+        old_string: z.string().describe("要被替换的原文本，须与文件内容完全一致（含缩进与空白）"),
+        new_string: z.string().describe("替换后的新文本"),
+        replace_all: z.boolean().optional().describe("相同片段出现多处时传 true 全部替换；默认仅允许唯一匹配"),
+      }),
+    }
+  );
+
+  // 工具：列目录（OS 沙箱 ro 档；条目 JSON 由 sidecar 产出，Node 侧仅格式化）
   const listDirectoryTool = tool(
     async ({ path: dir = "." }) => {
+      const target = resolveWorkspacePath(workspace, dir).path;
+      const unavailable = await ensureSandbox();
+      if (unavailable) return unavailable;
+      const r = await runFsOp("list", workspace, "ro", target);
+      if (!r.ok) return `列目录失败：${r.reason}`;
+      if (r.code !== 0) return `列目录失败：${r.stderr.split("\n")[0] || `退出码 ${r.code}`}`;
+      let entries: Array<{ name: string; type: string; size?: number }>;
       try {
-        const target = resolveWorkspacePath(workspace, dir).path;
-        const entries = fs.readdirSync(target, { withFileTypes: true });
-        if (!entries.length) return "(空目录)";
-        return entries
-          .map((e) => {
-            const type = e.isDirectory() ? "目录" : e.isFile() ? "文件" : "其他";
-            let suffix = "";
-            if (e.isFile()) {
-              try {
-                suffix = `，${fs.statSync(path.join(target, e.name)).size} 字节`;
-              } catch {
-                /* 文件刚被删除等场景忽略 */
-              }
-            }
-            return `- ${e.name}（${type}${suffix}）`;
-          })
-          .join("\n");
-      } catch (err) {
-        return `列目录失败：${(err as Error).message}`;
+        entries = JSON.parse(r.stdout || "[]");
+      } catch {
+        // 条目过多撑爆 200K 缓冲时 stdout 被截断，JSON 解不开
+        return "列目录失败：目录条目过多（输出超限），请改用 glob_search 按模式筛选";
       }
+      if (!entries.length) return "(空目录)";
+      return entries
+        .map((e) => {
+          const type = e.type === "dir" ? "目录" : e.type === "file" ? "文件" : "其他";
+          const size = e.type === "file" && typeof e.size === "number" ? `，${e.size} 字节` : "";
+          return `- ${e.name}（${type}${size}）`;
+        })
+        .join("\n");
     },
     {
       name: "list_directory",
@@ -240,7 +656,9 @@ function createFileTools(workspace: string) {
     }
   );
 
-  // 工具：按文件名 / 路径模式（glob）搜索文件路径，不读文件内容
+  // 工具：按文件名 / 路径模式（glob）搜索文件路径，不读文件内容。
+  // 用捆绑 rg --files（经沙箱）：刻意无视 gitignore（--no-ignore）并包含隐藏文件
+  // （--hidden），噪声目录大括号一次排除（后序 -g 优先）
   const globSearchTool = tool(
     async ({ pattern, path: dir = "." }) => {
       if (!pattern) return "请提供要匹配的 glob 模式。";
@@ -248,20 +666,37 @@ function createFileTools(workspace: string) {
         const root = resolveWorkspacePath(workspace, dir).path;
         if (!fs.existsSync(root)) return `目录不存在：${root}`;
         if (!fs.statSync(root).isDirectory()) return `目标不是目录：${root}`;
-        const hits = (
-          await globby(pattern, {
-            cwd: root,
-            ignore: NOISE_IGNORE,
-            dot: true, // .env 等隐藏文件仍可被搜到，噪声目录靠 ignore 排除
-            expandDirectories: false, // 保留 glob 原语义：*.ts 只匹配根层，不自动展开目录
-            followSymbolicLinks: false,
-            suppressErrors: true, // 读不了的目录跳过
-          })
-        ).sort();
-        if (!hits.length) return `没有匹配「${pattern}」的文件。`;
-        return hits.length > 200
-          ? hits.slice(0, 200).join("\n") + `\n（共 ${hits.length} 个匹配，仅显示前 200 个）`
-          : hits.join("\n");
+        const unavailable = await ensureSandbox();
+        if (unavailable) return unavailable;
+        const args = [
+          "--files",
+          "--hidden",
+          "--no-ignore",
+          "-g",
+          pattern,
+          "-g",
+          `!**/{${NOISE_DIRS.join(",")}}/**`,
+        ];
+        // 根层锚定语义（'*.ts' 不进子目录）：rg 无等价开关，靠 --max-depth 表达，
+        // 无 ** 的模式深度固定为「模式内 / 数 + 1」
+        if (!pattern.includes("**")) args.push("--max-depth", String(pattern.split("/").length));
+        const { lines, stderr, code, truncated, timedOut, unavailable: reason } = await runRipgrep(args, root, 201);
+        if (reason) return sandboxUnavailable(reason);
+        // rg 退出码：0 有文件，1 无匹配，2 出错；部分目录不可读时仍输出可用结果
+        if (code === 2 && !lines.length) {
+          if (stderr.includes("No files were searched"))
+            return `没有匹配「${pattern}」的文件（候选全被忽略规则过滤掉了）。`;
+          return `搜索失败：${stderr.split("\n")[0]?.trim() || "ripgrep 执行出错"}`;
+        }
+        if (timedOut && !lines.length) return "搜索失败：rg 超过 30 秒未完成";
+        if (code === null && !lines.length) return `搜索失败：${stderr.split("\n")[0]?.trim() || "ripgrep 执行出错"}`;
+        // 早停于 201 行：>200 时精确计数不再可得
+        const shown = lines.slice(0, 200).sort();
+        if (!shown.length) return `没有匹配「${pattern}」的文件。`;
+        let result = shown.join("\n");
+        if (truncated || lines.length > 200) result += `\n（匹配超过 200 个，仅显示前 200 个）`;
+        if (timedOut) result += `\n（搜索超过 30 秒被中止，以上为已找到的结果）`;
+        return result;
       } catch (err) {
         return `搜索失败：${(err as Error).message}`;
       }
@@ -287,6 +722,8 @@ function createFileTools(workspace: string) {
         const stat = fs.statSync(root);
         const isDir = stat.isDirectory();
         if (!isDir && !stat.isFile()) return `目标不是文件或目录：${root}`;
+        const unavailable = await ensureSandbox();
+        if (unavailable) return unavailable;
         const args = [
           "--with-filename",
           "--line-number",
@@ -305,11 +742,14 @@ function createFileTools(workspace: string) {
         } else {
           args.push("--", pattern, root); // 单文件显式指定，不受忽略规则与 glob 影响
         }
-        const { lines, stderr, code, truncated, timedOut } = await runRipgrep(
+        // 目录模式 cwd=根；单文件模式 cwd=工作区 + --ro 目标本体（Windows 读取授权）
+        const { lines, stderr, code, truncated, timedOut, unavailable: reason } = await runRipgrep(
           args,
           isDir ? root : workspace,
-          50
+          50,
+          isDir ? [] : [root]
         );
+        if (reason) return sandboxUnavailable(reason);
         // rg 退出码：0 有匹配，1 无匹配，2 出错
         if (code === 2 && !lines.length) {
           // include / 大小上限 / 忽略规则把候选文件全部筛掉时 rg 也退出 2，按无匹配处理更贴近本意
@@ -347,20 +787,22 @@ function createFileTools(workspace: string) {
     }
   );
 
-  return [readFileTool, writeFileTool, listDirectoryTool, globSearchTool, grepSearchTool];
+  return [readFileTool, writeFileTool, editFile, listDirectoryTool, globSearchTool, grepSearchTool];
 }
 
 // 装配完整工具集：文件操作按权限模式管控；搜索引擎按设置开关装配进 web_search。
 // 需要激活模型的配置（模型商搜索复用它的 API Key / Base URL），agent 重建时随之更新
 export function createTools(
   workspace: string,
+  permission: PermissionLevel,
   search: SearchSettings,
   config: AgentConfig
 ) {
   return [
     calculator,
     getCurrentTime,
-    ...createFileTools(workspace),
+    ...createFileTools(workspace, permission),
+    ...createSystemTools(workspace),
     createWebSearchTool(search, config),
     webFetchTool,
   ];

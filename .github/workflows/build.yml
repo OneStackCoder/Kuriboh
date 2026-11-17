@@ -41,7 +41,8 @@ jobs:
       - name: Install app dependencies
         run: npm ci
 
-      # esbuild 把 src 的 TS 打包成单个 app.mjs（依赖保持 external，运行时从 node_modules 加载）
+      # esbuild 把 src 的 TS 打包成单个 app.mjs（依赖保持 external，运行时从 node_modules 加载）；
+      # 前置的 sandbox/build.mjs 在 runner 本机平台编出 mino-sandbox sidecar（OS 沙箱用，与打包产物同平台）
       - name: Build app bundle
         run: npm run build
 
@@ -68,8 +69,8 @@ jobs:
           NAME="Mino-$VER-$GOOS-$GOARCH"
 
           # 业务代码与绝大部分依赖已由 esbuild 打进 app.mjs，这里只带运行时仍需落盘的部分：
-          # 原生模块（better-sqlite3 及其 bindings、webview 平台包）、grep_search 用的 ripgrep 二进制，
-          # 以及前端经 mino:// 读取的静态资源（globby 是纯 JS，已打进 app.mjs）
+          # 原生模块（better-sqlite3 及其 bindings、webview 平台包）、glob_search / grep_search 共用的 ripgrep 二进制，
+          # 以及前端经 mino:// 读取的静态资源
           stage_runtime_deps() {
             local dest="$1"
             mkdir -p "$dest/node_modules"
@@ -97,6 +98,8 @@ jobs:
               cp "launcher/$BIN" "$APPDIR/AppRun"
               cp -R build/app/. "$APPDIR/app/"
               stage_runtime_deps "$APPDIR/app"
+              # launcher 以 app 目录为 node 进程 cwd，sidecar 必须与之同目录（SANDBOX_BIN 按 cwd 定位）
+              cp mino-sandbox "$APPDIR/app/"
               mkdir -p "$APPDIR/usr/share/icons/hicolor/512x512/apps"
               cp assets/icon-512.png "$APPDIR/usr/share/icons/hicolor/512x512/apps/mino.png"
               cp assets/icon-512.png "$APPDIR/mino.png"
@@ -125,6 +128,7 @@ jobs:
               cp "launcher/$BIN" "$STAGE/"
               cp -R build/app/. "$STAGE/app/"
               stage_runtime_deps "$STAGE/app"
+              cp mino-sandbox.exe "$STAGE/app/"
               ARCHIVE="$NAME.zip"
               powershell -NoProfile -Command "Compress-Archive -Path 'dist/$NAME' -DestinationPath '$ARCHIVE' -Force"
               ;;
@@ -137,6 +141,7 @@ jobs:
               cp "launcher/$BIN" "$APP/Contents/MacOS/Mino"
               cp -R build/app/. "$APP/Contents/MacOS/app/"
               stage_runtime_deps "$APP/Contents/MacOS/app"
+              cp mino-sandbox "$APP/Contents/MacOS/app/"
               cp assets/icon.icns "$APP/Contents/Resources/Mino.icns"
               cat > "$APP/Contents/Info.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>

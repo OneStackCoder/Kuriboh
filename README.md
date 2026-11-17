@@ -20,15 +20,17 @@
 
 | 平台      | 必需                                   | 可选 / 说明                                                            |
 | ------- | ------------------------------------ | ------------------------------------------------------------------ |
-| Linux   | WebKitGTK 4.1、`libxdo`、X11 或 Wayland | `zenity`：目录选择器；`script`（util-linux）：内嵌终端伪 PTY；`stty`：终端尺寸同步；`bash` |
+| Linux   | WebKitGTK 4.1、`libxdo`、X11 或 Wayland | `zenity`：目录选择器；`script`（util-linux）：内嵌终端伪 PTY；`stty`：终端尺寸同步；`bash`；`bubblewrap`（bwrap）：OS 沙箱——文件工具必需，缺失时文件工具停用不回退；run_command / process_start 缺失时仍回退宿主机执行并在结果中标注 |
 | Windows | WebView2 Runtime、PowerShell          | Win11 与新版 Edge 自带 WebView2，Win10 缺失时会弹窗引导安装                        |
 | macOS   | 11 及以上（系统自带 WebKit）                  | `script`、`pgrep` / `ps`：终端尺寸同步                                     |
 
 Debian / Ubuntu 安装示例（包名因发行版而异）：
 
 ```bash
-sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux
+sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux bubblewrap
 ```
+
+系统命令（run_command / process_start）与文件读写搜索（read_file / write_file / edit_file / list_directory / glob_search / grep_search）默认在 OS 沙箱内执行（断网、系统目录只读、写入仅限工作区、用户主目录与临时目录）：Linux 依赖 `bubblewrap`，内核 ≥ 5.13 时自动叠加 Landlock 第二道写入防线（无需安装）；Windows 使用系统内置 AppContainer，macOS 使用系统自带 sandbox-exec，均无需额外依赖。沙箱不可用时命令自动回退宿主机执行并在结果中标注；文件工具则直接报错停用、不回退。经用户确认的工作区外写入也仍被沙箱限制在用户主目录与临时目录内。系统命令与进程操作在「仅可查看」「工作区内」权限下逐次弹卡确认，「完全权限」下免确认直接执行；其中 run_command 的纯只读查询命令（Linux/macOS 下 uname、ps、df、cat、sw_vers、system_profiler 等，Windows 下 systeminfo、tasklist、Get-Process、dir 等，且不含命令替换 / 子 shell / 写文件重定向）任意权限下都直接执行；for / while / if 等复合命令会做语法分析，条件与循环体内全部为只读查询时同样直接执行。沙箱的技术原理、平台实现与安全边界详见 [README-sandbox.md](README-sandbox.md)。
 
 ## 运行
 
@@ -36,7 +38,7 @@ sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux
 npm install
 npm start                # 打开对话窗口（在「设置 → 模型」里添加模型配置）
 npm run typecheck        # tsc --noEmit 类型检查
-npm run build:local      # 打包到 build/app，并编译本平台 launcher 到 build/（需 Go）
+npm run build:local      # 编译 mino-sandbox sidecar，打包到 build/app，并编译本平台 launcher 到 build/（需 Go）
 ```
 
 支持 OpenAI / Anthropic / DeepSeek 及任意 OpenAI 兼容接口（Moonshot、智谱、本地网关等）。

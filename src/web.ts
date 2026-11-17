@@ -380,8 +380,9 @@ async function runChatStream({
           for (const intr of updates["__interrupt__"] as Array<{ value?: unknown }>) {
             const v = intr?.value;
             if (v == null || typeof v !== "object") continue;
-            const req = v as { type?: unknown; actionRequests?: unknown };
-            if (req.type !== "human_in_the_loop" || !Array.isArray(req.actionRequests)) continue;
+            // langchain 1.6 的 batched HITL interrupt value 只有 actionRequests/reviewConfigs，无类型标记，按 actionRequests 形状识别
+            const req = v as { actionRequests?: unknown };
+            if (!Array.isArray(req.actionRequests)) continue;
             confirmCalls = req.actionRequests.flatMap((a): Array<{ name: string; args: unknown; description?: string }> => {
               if (a == null || typeof a !== "object") return [];
               const { name, args, description } = a as {

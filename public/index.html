@@ -391,6 +391,12 @@
     font-size: 11px; line-height: 1.7;
     background: var(--tool-bg); border: 1px solid var(--tool-border); color: var(--tool-color);
   }
+  /* 用户批准的 run_command：工具块头上的「已批准」小徽标 */
+  .tool-block-head .tool-approved {
+    flex: none; padding: 0 7px; border-radius: 999px;
+    font-size: 11px; line-height: 1.7; white-space: nowrap;
+    color: var(--ok); background: var(--ok-soft);
+  }
   .tool-block-head .tool-summary {
     flex: 0 1 auto; min-width: 0; max-width: 44em; color: var(--text-4);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1243,7 +1249,7 @@
   const PERM_DESCS = {
     readonly: '读取任意文件无需确认；任何写入操作都需要你逐一确认',
     workspace: '读取不受限，工作区内自由读写；工作区外的写入需要你确认',
-    full: '任意位置的读写都无需确认，启用时需确认风险',
+    full: '任意读写与系统命令都无需确认，启用时需确认风险',
   };
   let currentPermission = 'workspace';
 
@@ -1659,8 +1665,8 @@
     return new Promise((resolve) => {
       permConfirmTitle.textContent = '风险提示：完全权限';
       permConfirmMsg.textContent =
-        '完全权限意味着 Agent 可以无需确认地写入工作区以外的任意文件（包括系统配置、密钥、个人数据等敏感位置）。' +
-        '模型输出若有错误或被恶意内容诱导，可能造成数据泄露或文件破坏。确定要启用吗？';
+        '完全权限意味着 Agent 可以无需确认地写入工作区以外的任意文件（包括系统配置、密钥、个人数据等敏感位置），并直接执行系统命令与进程操作。' +
+        '模型输出若有错误或被恶意内容诱导，可能造成数据泄露、文件破坏或更严重的系统影响。确定要启用吗？';
       permConfirmOk.textContent = '我已了解风险，启用';
       const close = (result) => {
         permConfirmOverlay.hidden = true;
@@ -2320,8 +2326,13 @@
     body.appendChild(wrap);
     const block = {
       name,
+      argsJson: JSON.stringify(args ?? null),
       setEngine(tag) {
         head.insertBefore(el('span', 'tool-engine', tag), summary);
+      },
+      markApproved() {
+        if (head.querySelector('.tool-approved')) return;
+        head.insertBefore(el('span', 'tool-approved', '✓ 已批准'), summary);
       },
       finish(text, ok = true) {
         wrap.classList.remove('running');
@@ -2396,6 +2407,20 @@
           })
           .catch((err) => card.appendChild(el('div', 'error', '提交确认失败: ' + err.message)));
       };
+      // 已批准的 run_command：给对应工具块挂「已批准」徽标；按名称+参数 JSON 配对
+      //（确认卡只列被拦截的调用，同轮被放行的只读调用不占行，按出现序会标错块）
+      const markApprovedRun = (i) => {
+        const call = calls[i];
+        const argsJson = JSON.stringify(call.args ?? null);
+        // 同名同参的多次调用按出现序依次配对
+        const nth = calls.slice(0, i).filter((c) => c && c.name === call.name && JSON.stringify(c.args ?? null) === argsJson).length;
+        let seen = 0;
+        for (const t of body._pendingTools || []) {
+          if (t.name !== call.name || t.argsJson !== argsJson) continue;
+          if (seen === nth) { if (t.markApproved) t.markApproved(); return; }
+          seen++;
+        }
+      };
       const decide = (i, ok) => {
         if (decisions[i]) return; // 该行已决策，锁定
         decisions[i] = ok ? { type: 'approve' } : { type: 'reject', message: '用户拒绝执行该操作' };
@@ -2403,6 +2428,7 @@
         marks[i].textContent = ok ? '已允许' : '已拒绝';
         marks[i].className = 'confirm-mark ' + (ok ? 'ok' : 'no');
         btns[i].remove();
+        if (ok && calls[i].name === 'run_command') markApprovedRun(i);
         if (decisions.every(Boolean)) submit();
       };
       calls.forEach((call, i) => {
