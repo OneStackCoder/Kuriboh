@@ -561,31 +561,31 @@ export function startWebUI(): void {
     const mod = await import("@webviewjs/webview");
     const Application = mod.Application ?? mod.default?.Application;
     const app = new Application();
-    // Windows 的窗口图标默认取自宿主进程 node.exe。仅靠创建后调 setWindowIcon 在 Windows 上
-    // 仍显示 node 图标，改走创建参数：windowsTaskbarIcon 在注册窗口类时写入 hIcon（标题栏 /
-    // 任务栏共用），创建后再补一次 WM_SETICON 兜底。其余平台忽略该参数
+    // 窗口图标直接传 PNG 字节：Windows 默认继承宿主 node.exe 图标，标题栏/任务栏需
+    // 分别经 setWindowIcon / setTaskbarIcon 覆盖（setTaskbarIcon 仅 Windows 生效）。
+    // Linux 经 GTK 设置的是传统 WM 窗口图标；GNOME Dock/Alt-Tab 按 .desktop 匹配应用、
+    // 不读窗口图标，故 npm start（无 .desktop）时 Dock 仍显示通用图标——环境机制，非调用失效。
     let winIcon: Buffer | null = null;
-    const isWin = process.platform === "win32";
-    if (isWin) {
-      try {
-        winIcon = fs.readFileSync(path.join(ROOT, "public", "icon.png"));
-      } catch {
-        // 图标缺失不影响启动
-      }
+    try {
+      winIcon = fs.readFileSync(path.join(ROOT, "public", "icon.png"));
+    } catch {
+      // 图标缺失不影响启动
     }
+    const isWin = process.platform === "win32";
     const win = app.createBrowserWindow({
       title: "Kuriboh",
       width: 1300,
       height: 900,
       logical: true, // 尺寸按逻辑像素解释：HiDPI（scaleFactor=2）下物理像素会被缩放一半
       resizable: true,
-      ...(winIcon ? { windowsTaskbarIcon: { data: winIcon } } : {}),
+      ...(isWin && winIcon ? { windowsTaskbarIcon: { data: winIcon } } : {}),
     });
-    if (isWin && winIcon) {
+    if (winIcon) {
       try {
         win.setWindowIcon(winIcon);
+        win.setTaskbarIcon(winIcon);
       } catch {
-        // 设置失败不阻塞启动，窗口类图标已兜底
+        // 设置失败不阻塞启动，创建参数已兜底
       }
     }
 
