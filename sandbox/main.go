@@ -17,8 +17,8 @@
 // 读取不限制在工作区，三平台全盘可读（uid/DACL 权限照常生效；Windows 受限令牌
 // 不拦 socket，断网缺失见 windows.go 头注释；临时目录 Linux/Windows 为私有实例，
 // macOS 为宿主共享 /tmp，见 darwin.go 头注释）。
-// scope 三档：ro=全盘禁写（read/list 用）；ws=工作区∪tmp 可写（run/start 现语义）；
-// home=工作区∪$HOME∪tmp 可写（full 级写工作区外文件用，恒含工作区）。
+// scope 三档：ro=全盘禁写（read/list 用）；ws=工作区∪tmp∪语言缓存目录（cache.go）可写
+//（run/start 现语义）；home=工作区∪$HOME∪tmp 可写（full 级写工作区外文件用，恒含工作区）。
 package main
 
 import (

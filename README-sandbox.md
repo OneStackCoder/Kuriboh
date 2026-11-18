@@ -28,17 +28,17 @@ kuriboh-sandbox（Go sidecar）── 建立沙箱 ──▶ OS 沙箱
 | read_file / write_file / edit_file / list_directory | `fs read/write/list` | **硬失败拒绝**，不回退 |
 | glob_search / grep_search | `run`（跑捆绑 rg） | **硬失败拒绝**，不回退 |
 
-两种语义是刻意区分的：命令已被用户在确认卡片批准过，沙箱只是加固，缺失时回退宿主机不改变授权面；文件工具则涉及写入 containment，**写路径宁可失败不可越权**——不可用一律报错停用。edit_file 是 `fs read` + `fs write` 的组合：读走 ro 档，写回走 write_file 同一 scope 判定。
+两种语义是刻意区分的：文件工具涉及写入 containment，**写路径宁可失败不可越权**——不可用一律报错停用；命令默认在用户确认（或只读白名单放行）后才执行，沙箱只是加固，缺失时回退宿主机不改变授权面。唯一例外是 `workspace` 权限级：OS 沙箱可用时 `run_command` 免确认执行（写入被沙箱限制在工作区，与文件工具的工作区内写同等约束），这条免确认路径上沙箱运行时失灵不回退宿主机、直接报错——未确认过的命令不能落到无约束宿主机。edit_file 是 `fs read` + `fs write` 的组合：读走 ro 档，写回走 write_file 同一 scope 判定。
 
 ## scope 三档
 
 | 档 | 可写范围 | 使用方 |
 | --- | --- | --- |
 | `ro` | 全盘只读（仅私有临时目录可写） | read_file / list_directory / rg 搜索 |
-| `ws` | 工作区 ∪ 临时目录 | run_command 默认；权限面允许的工作区内写入 |
+| `ws` | 工作区 ∪ 临时目录 ∪ 语言缓存目录（npm / NuGet / pip / Go / Cargo / Maven 等默认缓存，见 `sandbox/cache.go`） | run_command 默认；权限面允许的工作区内写入 |
 | `home` | 工作区 ∪ 用户主目录 ∪ 临时目录 | 经用户确认的工作区外写入（恒含工作区） |
 
-即便用户在确认卡片批准了工作区外写入，OS 也只放开到 `home` 档——写入不可能越过「HOME ∪ 工作区 ∪ 临时目录」，这就是写入 containment。
+即便用户在确认卡片批准了工作区外写入，OS 也只放开到 `home` 档——写入不可能越过「HOME ∪ 工作区 ∪ 临时目录 ∪ 语言缓存目录」，这就是写入 containment。
 
 ## CLI 契约
 
@@ -73,7 +73,7 @@ Landlock 是 Linux ≥ 5.13 内核自带的 LSM（无需安装，版本满足即
 从自身令牌派生受限令牌（`CreateRestrictedToken`，标志 `DISABLE_MAX_PRIVILEGES | WRITE_RESTRICTED`），挂入固定的 Kuriboh 限制 SID。`WRITE_RESTRICTED` 的语义恰好对齐 Linux 的 `--ro-bind / /`：
 
 - **读放行**：读 / 执行访问只走普通 DACL 校验（用户身份不变）——**全盘可读**，他人私有文件照常被拒；`DISABLE_MAX_PRIVILEGES` 清空特权，封堵 SeBackup / SeTakeOwnership 等 ACL 旁路。
-- **写管住**：写访问走双重校验（普通 DACL **且** 限制 SID 获授权）——宿主盘上默认不含该 SID 的 ACE，**全盘默认禁写**；再按 scope 对白名单目录授予 F（ws=工作区，home=HOME ∪ 工作区），子目录容器继承。
+- **写管住**：写访问走双重校验（普通 DACL **且** 限制 SID 获授权）——宿主盘上默认不含该 SID 的 ACE，**全盘默认禁写**；再按 scope 对白名单目录授予 F（ws=工作区 ∪ 语言缓存目录，home=HOME ∪ 工作区），子目录容器继承。
 - **临时目录**：每次启动私有实例（授予 F 并重定向 `TEMP` / `TMP`），run 结束即删。
 - **进程清理**：Job Object（KILL_ON_JOB_CLOSE）+ 挂起启动、Assign 后 Resume，sidecar 退出即清场。
 - **已知取舍**：受限令牌不拦 socket，沙箱内命令进程**可联网**（Linux/macOS 断网不变，已确认接受）；Everyone 可写目录对沙箱进程可写（同 uid 语义，Linux 本就如此）。受限令牌与 ACL 为内核强制，单层防线即生效。
@@ -107,11 +107,11 @@ kuriboh-sandbox fs read …            # 外层：解析参数 → 建沙箱 →
 
 ## 安全边界
 
-- **写入 containment**：OS 按 ro/ws/home 三档硬性保证，见上表；确认后的区外写也仅限 HOME 与临时目录。
+- **写入 containment**：OS 按 ro/ws/home 三档硬性保证，见上表；确认后的区外写也仅限 HOME、临时目录与语言缓存目录。
 - **symlink 逃逸封堵**：工作区 / 主目录解析真实路径后挂载与授权（Linux bind + Landlock 白名单、macOS 双写法），指向区外的符号链接无法借道。
 - **断网**：沙箱内 `curl` / `wget` / `pip install` 等联网命令一律不可用——防止「下载脚本直通本地盘」。信息检索类工具（web_search / web_fetch）在 Node 进程内直接请求，不经沙箱。
 - **进程管理**：process_stop 仅允许终止 Kuriboh 自己启动的进程（pgid / pid 白名单，Unix 下组杀不误伤）。
-- **权限确认**：系统命令与进程操作无论什么权限级别都逐次经用户确认；文件写入按 readonly / workspace / full 三级确认（详见 AGENTS.md 红线 4）。
+- **权限确认**：文件写入按 readonly / workspace / full 三级确认；`run_command` 在 workspace 级且 OS 沙箱可用时免确认（写入被沙箱限制在工作区与语言缓存目录内），其余情况与 process_start / process_stop / open_application 一样逐次经用户确认（详见 AGENTS.md 红线 4）。
 
 ## 已知局限
 

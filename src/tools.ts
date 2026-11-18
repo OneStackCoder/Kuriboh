@@ -85,6 +85,9 @@ const SANDBOX_MARKER = "KURIBOH_SANDBOX_UNAVAILABLE:";
 // 时不反复探测。缓存带原因：run_command/process_start 回退时只判 ok，
 // 文件工具硬失败时要把原因展示给用户
 let sandboxProbe: Promise<{ ok: boolean; reason: string | null }> | null = null;
+// 同步快照：探测落定后更新。拦截层（humanInTheLoopMiddleware 的 when 回调）只能同步
+// 判定，需通过它读探测结果；null = 尚未落定，保守视为不可用
+let sandboxOkNow: boolean | null = null;
 function isSandboxAvailable(): Promise<{ ok: boolean; reason: string | null }> {
   sandboxProbe ??= new Promise((resolve) => {
     const child = spawn(SANDBOX_BIN, ["probe"], {
@@ -96,7 +99,11 @@ function isSandboxAvailable(): Promise<{ ok: boolean; reason: string | null }> {
     child.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < 400) stderr += chunk.toString();
     });
-    const fail = (reason: string) => resolve({ ok: false, reason });
+    const settle = (r: { ok: boolean; reason: string | null }) => {
+      sandboxOkNow = r.ok;
+      resolve(r);
+    };
+    const fail = (reason: string) => settle({ ok: false, reason });
     child.on("error", (err) => {
       fail(
         (err as NodeJS.ErrnoException).name === "AbortError"
@@ -106,7 +113,7 @@ function isSandboxAvailable(): Promise<{ ok: boolean; reason: string | null }> {
     });
     child.on("close", (code) => {
       if (code === 0) {
-        resolve({ ok: true, reason: null });
+        settle({ ok: true, reason: null });
         return;
       }
       // probe 失败同样走 125+marker 契约，剥出 sidecar 给的具体原因
@@ -116,6 +123,11 @@ function isSandboxAvailable(): Promise<{ ok: boolean; reason: string | null }> {
     });
   });
   return sandboxProbe;
+}
+
+// OS 沙箱可用性的同步快照：agent.ts 拦截层判定 workspace 级 run_command 免确认时用
+export function sandboxReady(): boolean | null {
+  return sandboxOkNow;
 }
 
 // 从执行结果提取「沙箱未建立」的原因；非 null 即调用方需回退宿主机执行
@@ -236,12 +248,49 @@ async function runFsOp(
   return { ok: true, ...r };
 }
 
+// Windows PowerShell 解释器解析（run_command 与内嵌终端共用）：
+// pwsh.exe 只有 PowerShell 6+ 才有（5.1 叫 powershell.exe），找到即视为「有新版」
+// 直接使用——模型生成的现代 PS 语法（&& 链、?? 等）在 5.1 会失败。pwsh 不一定在
+// PATH 里（MSI 装到固定目录），所以同时扫 PATH 与系统 / 用户两个安装根目录
+// （其下是 7、7-preview 等版本目录）；都没有才退回 5.1
+export function resolveWinShell(): string {
+  const dirs = new Set<string>(
+    (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)
+  );
+  for (const root of [
+    process.env.ProgramFiles
+      ? path.join(process.env.ProgramFiles, "PowerShell")
+      : "",
+    process.env.LOCALAPPDATA
+      ? path.join(process.env.LOCALAPPDATA, "Microsoft", "PowerShell")
+      : "",
+  ]) {
+    if (!root) continue;
+    try {
+      for (const ver of fs.readdirSync(root)) dirs.add(path.join(root, ver));
+    } catch {
+      /* 根目录不存在或不可读，跳过 */
+    }
+  }
+  for (const dir of dirs) {
+    try {
+      if (fs.statSync(path.join(dir, "pwsh.exe")).isFile()) {
+        return path.join(dir, "pwsh.exe");
+      }
+    } catch {
+      /* 该目录下没有 pwsh.exe，继续找 */
+    }
+  }
+  return "powershell.exe";
+}
+
 // 用户命令 → shell argv（沙箱与宿主回退共用同一套，保证两条路径行为一致）。
-// Windows 走 PowerShell：中文管道默认 GBK，先切 UTF-8 再执行用户命令；其余平台 sh -c
+// Windows 走 PowerShell（装有 PS7 时优先）：中文管道默认 GBK，先切 UTF-8 再执行
+// 用户命令；其余平台 sh -c
 function shellArgv(command: string): { file: string; argv: string[] } {
   if (process.platform === "win32") {
     return {
-      file: "powershell.exe",
+      file: resolveWinShell(),
       argv: [
         "-NoLogo",
         "-NonInteractive",
@@ -270,8 +319,10 @@ function spawnDetached(file: string, argv: string[]): Promise<number> {
 //（Windows），宿主回退登记 pid。process_stop 只终止表内进程，ESRCH 时清除登记
 const managedPids = new Map<number, { command: string; time: number }>();
 
-// 工厂：系统工具按工作区构建（run_command 默认在工作区目录下执行）
-function createSystemTools(workspace: string) {
+// 工厂：系统工具按工作区与权限级别构建（run_command 默认在工作区目录下执行）
+function createSystemTools(workspace: string, permission: PermissionLevel) {
+  // 提前触发探测：让 sandboxReady 快照尽早落定，拦截层的免确认判定才有值可读
+  void isSandboxAvailable();
   const runCommand = tool(
     async ({ command, timeoutMs }) => {
       const timeout = Math.min(Math.max(timeoutMs ?? 30_000, 1_000), 120_000);
@@ -288,6 +339,12 @@ function createSystemTools(workspace: string) {
       if ((await isSandboxAvailable()).ok) {
         const r = await runInSandbox([shell.file, ...shell.argv], workspace, timeout);
         if (r.unavailable === null) return format(r);
+        // workspace 级免确认建立在「沙箱把写入限制在工作区」之上：该路径的命令从未经用户
+        // 确认，沙箱运行时失灵不得静默落到无约束的宿主机（对齐文件工具的硬失败语义）；
+        // 仍会走确认的场景（沙箱探测不可用 / readonly 级）维持宿主机回退
+        if (permission === "workspace" && sandboxReady() === true) {
+          return `命令执行失败：OS 沙箱运行时不可用（${r.unavailable}），免确认路径不回退宿主机执行。请修复沙箱（如重新运行 npm run build:sandbox）后重试，或临时切换权限模式。`;
+        }
         const host = await runShellCommand(shell.file, shell.argv, workspace, timeout);
         return `（沙箱不可用：${r.unavailable}；以下为宿主机直接执行的结果）\n${format(host)}`;
       }
@@ -298,7 +355,7 @@ function createSystemTools(workspace: string) {
     {
       name: "run_command",
       description:
-        "执行一条系统命令并返回输出（Windows 为 PowerShell，macOS/Linux 为 sh）。默认在 OS 沙箱内执行：断网、系统目录只读、仅当前工作区可写；沙箱不可用时自动改在宿主机执行并在结果中标注。用于查询系统状态（CPU、内存、磁盘、网络、进程列表等）或运行脚本；默认 30 秒超时，输出超长会截断。纯只读查询命令（uname、ps、df、cat 等）直接执行；修改类命令执行前会请用户确认（「完全权限」模式下免确认）。",
+        "执行一条系统命令并返回输出（Windows 为 PowerShell，macOS/Linux 为 sh）。默认在 OS 沙箱内执行：断网、系统目录只读、仅当前工作区可写；沙箱不可用时自动改在宿主机执行并在结果中标注。用于查询系统状态（CPU、内存、磁盘、网络、进程列表等）或运行脚本；默认 30 秒超时，输出超长会截断。纯只读查询命令（uname、ps、df、cat 等）直接执行；修改类命令执行前会请用户确认（「完全权限」模式免确认，「工作区内修改」模式下 OS 沙箱可用时同样免确认——写入已被沙箱限制在工作区内）。",
       schema: z.object({
         command: z.string().describe("要执行的命令"),
         timeoutMs: z.number().int().optional().describe("可选，超时毫秒数，默认 30000，范围 1000-120000"),
@@ -796,7 +853,7 @@ export function createTools(
     calculator,
     getCurrentTime,
     ...createFileTools(workspace, permission),
-    ...createSystemTools(workspace),
+    ...createSystemTools(workspace, permission),
     createWebSearchTool(search, config),
     webFetchTool,
   ];

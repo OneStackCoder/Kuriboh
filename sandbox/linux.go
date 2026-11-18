@@ -42,8 +42,11 @@ func bwrapCommand(cwd, scope string, argv []string, dieWithParent bool) *exec.Cm
 		args = append(args, "--bind", home, home, "--bind", cwd, cwd)
 	case "ro":
 		// 不绑工作区：rootfs 只读即全盘禁写
-	default: // ws：工作区是沙箱内唯一可写宿主目录
+	default: // ws：工作区 + 各语言缓存目录（cache.go）是沙箱内可写宿主目录
 		args = append(args, "--bind", cwd, cwd)
+		for _, dir := range langCacheDirs() {
+			args = append(args, "--bind", dir, dir)
+		}
 	}
 	args = append(args, "--chdir", cwd)
 	if dieWithParent {

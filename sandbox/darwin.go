@@ -20,7 +20,7 @@ import (
 // 能力对齐，uid 权限照常）；(deny network*) 断网（macOS 无 netns 可用，
 // ifconfig / netstat 等只读 ioctl/sysctl 的状态查询不受影响）；
 // (deny file-write*) 全盘禁写，再按 scope 放行 subpath：
-// ro=仅 tmp；ws=+工作区（现 run/start 语义）；home=+工作区∪$HOME（恒含工作区）。
+// ro=仅 tmp；ws=+工作区∪语言缓存目录（现 run/start 语义）；home=+工作区∪$HOME（恒含工作区）。
 //
 // Seatbelt 按路径字符串匹配、不解析符号链接，所以别名要双写法放行：
 // /tmp 是 /private/tmp 的符号链接；工作区/HOME 也可能含符号链接（如 /var → /private/var），
@@ -42,6 +42,15 @@ func seatbeltProfile(workspace, scope string) string {
 			allow(real)
 		}
 		allow(filepath.Clean(workspace))
+	}
+	if scope == "ws" {
+		// 各语言缓存目录（cache.go）：与 workspace 同样双写法（原路径 + EvalSymlinks）
+		for _, dir := range langCacheDirs() {
+			if real, err := filepath.EvalSymlinks(dir); err == nil {
+				allow(real)
+			}
+			allow(filepath.Clean(dir))
+		}
 	}
 	if scope == "home" {
 		// HOME 有效性由 sandboxRun 先行校验

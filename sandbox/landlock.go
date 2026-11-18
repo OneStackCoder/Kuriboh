@@ -19,8 +19,9 @@ import (
 )
 
 // 写白名单映射，与 bwrap 绑定集合同源（linux.go bwrapCommand）：
-// ro=∅（read/list 恒只读档，全盘禁写含私有 /tmp）；ws=工作区∪/tmp；home=工作区∪HOME∪/tmp
-// （恒含工作区，与 bwrap home 档一致）。HOME 有效性由外层 sandboxRun home 档先行校验。
+// ro=∅（read/list 恒只读档，全盘禁写含私有 /tmp）；ws=工作区∪/tmp∪语言缓存目录；
+// home=工作区∪HOME∪/tmp（恒含工作区，与 bwrap home 档一致，缓存目录在 HOME 下天然覆盖）。
+// HOME 有效性由外层 sandboxRun home 档先行校验。
 func landlockWritableDirs(scope, cwd string) []string {
 	switch scope {
 	case "home":
@@ -28,7 +29,7 @@ func landlockWritableDirs(scope, cwd string) []string {
 	case "ro":
 		return nil
 	default: // ws
-		return []string{cwd, "/tmp"}
+		return append([]string{cwd, "/tmp"}, langCacheDirs()...)
 	}
 }
 

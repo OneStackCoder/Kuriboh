@@ -467,6 +467,7 @@
     border: 1px dashed var(--border-strong); border-radius: 6px; padding: 2px 8px; margin-bottom: 6px;
   }
   .error { color: var(--danger); }
+  .stopped-tag { font-size: 12px; color: var(--text-3); }
   .md p { margin: 0 0 8px; } .md p:last-child { margin-bottom: 0; }
   .md pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
   .md code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
@@ -513,6 +514,9 @@
   #modelBtn { margin-left: auto; }
   #send:hover { background: var(--accent-hover); }
   #send:disabled { background: var(--accent-disabled); cursor: not-allowed; }
+  /* 会话进行中按钮切换为停止态：红色描边方块，保持可点击 */
+  #send.stop { background: transparent; color: var(--danger); border: 1.5px solid var(--danger); }
+  #send.stop:hover { background: var(--danger); color: #fff; }
   /* 工作区下拉菜单（复用 .ctx-menu 的定位容器样式） */
   .ws-menu { min-width: 260px; max-width: 340px; }
   .ws-list { max-height: 280px; overflow-y: auto; padding: 4px; }
@@ -769,7 +773,7 @@
     <div>会话保存在本机，重启后可继续</div>
   </div>
 </aside>
-<div id="sideDrag" title="拖动调整会话栏宽度"></div>
+<div id="sideDrag"></div>
 <!-- 会话右键菜单（重命名 / 重新加载） -->
 <div id="ctxMenu" class="ctx-menu">
   <div class="ctx-item" id="ctxRename">重命名</div>
@@ -809,7 +813,7 @@
 </div>
 <!-- 右侧：工具面板（页面内右侧栏，侧栏「工具面板」按钮开关） -->
 <div id="toolPanel" hidden>
-  <div id="panelDrag" title="拖动调整面板宽度"></div>
+  <div id="panelDrag"></div>
   <div id="panelMain">
     <header class="ptabs">
       <button class="ptab active" data-ptab="start">
@@ -1144,7 +1148,13 @@
   const input = document.getElementById('input');
   const sendBtn = document.getElementById('send');
   const sessionsBox = document.getElementById('sessions');
-  let busy = false;
+  // 会话运行缓冲：sid → { events, finished, body }。会话切走后事件继续按 threadId
+  // 缓冲，切回时截断 checkpoint 尾部重复轮次后重放；finished 记 done/stopped/error
+  const running = new Map();
+  const isRunning = (id) => {
+    const e = id && running.get(id);
+    return !!e && !e.finished;
+  };
   let currentSessionId = null; // 当前会话 id（新会话发送首条消息前为 null）
   let sessionQuery = ''; // 会话搜索关键字（前端按标题过滤）
   let editingId = null; // 正在行内重命名的会话 id（refreshSessions 保留渲染编辑框）
@@ -1306,7 +1316,7 @@
   }
 
   async function activateSavedModel(id) {
-    if (busy || id === modelsState.activeId) return;
+    if (isRunning(currentSessionId) || id === modelsState.activeId) return;
     try {
       applyModels(await window.KuribohAgent.setActiveModel(id));
       await resetChatForNewSession();
@@ -1692,7 +1702,7 @@
   }
   async function choosePerm(level) {
     hidePermMenu();
-    if (busy || level === currentPermission) return;
+    if (isRunning(currentSessionId) || level === currentPermission) return;
     // 切换到「完全权限」需确认风险；取消则保持原权限
     if (level === 'full') {
       const ok = await askPermConfirm();
@@ -1708,7 +1718,7 @@
   }
   permBtn.onclick = (e) => {
     e.stopPropagation();
-    if (busy) return;
+    if (isRunning(currentSessionId)) return;
     if (permMenu.style.display === 'block') { hidePermMenu(); return; }
     renderPermMenu();
     hideWsMenu();
@@ -1857,7 +1867,7 @@
     modelInput.hidden = !manual;
     if (manual) modelInput.focus();
   };
-  document.getElementById('settings').onclick = () => { if (!busy) openSettings(); };
+  document.getElementById('settings').onclick = () => openSettings();
   document.getElementById('settingsCancel').onclick = () => {
     overlay.hidden = true;
     bochaConfigOverlay.hidden = true;
@@ -1950,7 +1960,7 @@
       item.append(check, body);
       item.onclick = async () => {
         hideWsMenu();
-        if (busy || isActive) return;
+        if (isRunning(currentSessionId) || isActive) return;
         if (locked) { showWsMsg('已有对话历史，不能切换工作区（可先点「新对话」）'); return; }
         try {
           wsState = await window.KuribohAgent.setWorkspace(w.id);
@@ -2087,12 +2097,18 @@
     pendingDeleteSessionId = null;
     if (!id) return;
     const r = await window.KuribohAgent.deleteSession(id);
+    running.delete(id); // 运行缓冲随会话一并丢弃（后端已先定向停止该轮）
     if (r && r.cleared) {
       // 删除的是当前会话：原生侧已开启新会话，界面清空；权限回到默认值
       list.innerHTML = '';
       currentSessionId = null;
       currentPermission = 'workspace';
       renderPermBtn();
+      // 删除的可能是流式中的当前会话：视图回到新会话，恢复发送态与三项解锁
+      setStopMode(false);
+      wsBtn.disabled = false;
+      modelBtn.disabled = false;
+      permBtn.disabled = false;
       renderWorkspaces(); // 回到新会话 → 解锁工作区切换
       input.focus();
     }
@@ -2234,9 +2250,6 @@
       .replace(/\\\(([\s\S]+?)\\\)/g, (_m, f) => '$' + f + '$');
     return DOMPurify.sanitize(marked.parse(conv));
   }
-  // 当前流式回答的容器与累计文本（answer_start 新开一段，answer_delta 追加）
-  let streamMd = null;
-  let streamText = '';
   // ---------- 思考过程面板 ----------
   // pending: 发送后的「正在思考…」占位（模型没有思维链时随首个事件直接撤掉）
   // thinking: reasoning 流式中，灰色斜体增量实时展示
@@ -2393,6 +2406,7 @@
         bar.remove();
         window.KuribohAgent
           .resolveConfirm({
+            threadId: ev.threadId, // 多会话并发时可能有多个挂起的确认，按会话定向回传
             decisions: decisions.map((d) => d || { type: 'reject', message: '用户拒绝执行该操作' }),
           })
           .catch((err) => card.appendChild(el('div', 'error', '提交确认失败: ' + err.message)));
@@ -2451,27 +2465,31 @@
       card.appendChild(bar);
       body.appendChild(card);
     } else if (ev.type === 'answer_start') {
-      streamMd = el('div', 'md');
-      streamText = '';
-      body.appendChild(streamMd);
+      // 流式容器挂在 body 上而非模块级变量：多会话并发流式时互不串台
+      body._streamMd = el('div', 'md');
+      body._streamText = '';
+      body.appendChild(body._streamMd);
       // 复制用：本轮回答开一个新段落槽（工具调用后会再次 answer_start 换段）
       ((body.parentNode._rawParts ??= [])).push('');
     } else if (ev.type === 'answer_delta') {
-      if (!streamMd) {
-        streamMd = el('div', 'md');
-        streamText = '';
-        body.appendChild(streamMd);
+      if (!body._streamMd) {
+        body._streamMd = el('div', 'md');
+        body._streamText = '';
+        body.appendChild(body._streamMd);
         ((body.parentNode._rawParts ??= [])).push('');
       }
-      streamText += ev.text;
+      body._streamText += ev.text;
       // 整段重渲染：文本量小，成本可忽略，且能保证 Markdown/公式实时正确
-      streamMd.innerHTML = renderMd(streamText);
+      body._streamMd.innerHTML = renderMd(body._streamText);
       // 同步记录段落原文，hover 复制时取的就是 Markdown 源文本
       const parts = body.parentNode._rawParts;
-      if (parts) parts[parts.length - 1] = streamText;
+      if (parts) parts[parts.length - 1] = body._streamText;
     } else if (ev.type === 'error') {
       settlePendingTools(body, false); // 流中断：未完成的调用停止脉冲动画
       body.appendChild(el('div', 'error', '出错了: ' + ev.message));
+    } else if (ev.type === 'stopped') {
+      settlePendingTools(body, false); // 中止：未完成的调用停止脉冲动画
+      body.appendChild(el('div', 'stopped-tag', '已停止'));
     } else if (ev.type === 'done') {
       if (!body.querySelector('.md') && !body.querySelector('.error')) {
         body.appendChild(el('div', 'md', '(无回复)'));
@@ -2479,6 +2497,22 @@
     }
     scrollDown();
   }
+
+  // ---------- 事件路由：会话进行时可切走，事件按 threadId 分流 ----------
+  // 全局单例绑定（不再每轮覆盖）：当前会话的事件实时渲染进 entry.body，
+  // 其他会话只进缓冲，切回时由 renderHistory 截断 checkpoint 尾部重复轮后重放补上
+  function routeEvent(ev) {
+    if (!ev.threadId) return; // config 等全局事件，前端不消费
+    const entry = running.get(ev.threadId);
+    if (!entry) return; // 会话已删除等无缓冲场景，直接丢弃
+    entry.events.push(ev);
+    if (ev.type === 'done' || ev.type === 'stopped' || ev.type === 'error') {
+      entry.finished = ev.type;
+      if (ev.threadId !== currentSessionId) refreshSessions(); // 后台轮结束：刷新侧栏活跃时间
+    }
+    if (ev.threadId === currentSessionId) handleEvent(ev, entry.body);
+  }
+  window.onKuribohAgentEvent = routeEvent;
 
   // ---------- 历史会话侧栏 ----------
   function fmtTime(ts) {
@@ -2536,7 +2570,7 @@
       del.title = '删除会话';
       del.onclick = (e) => {
         e.stopPropagation();
-        if (busy) return;
+        // 运行中的会话也允许删除：后端会先定向停止该轮再删
         pendingDeleteSessionId = s.id;
         sessionConfirmMsg.textContent =
           `删除会话「${s.title || '新对话'}」？该会话的对话记录将被永久删除，无法恢复。`;
@@ -2545,13 +2579,20 @@
       item.appendChild(meta);
       item.appendChild(del);
       item.onclick = async () => {
-        if (busy || s.id === currentSessionId) return;
+        if (s.id === currentSessionId) return;
         const detail = await window.KuribohAgent.openSession(s.id);
         currentSessionId = detail.id;
         currentPermission = detail.permission; // 恢复该会话的权限设置
         renderPermBtn();
-        renderHistory(detail.items);
+        // 目标会话有运行缓冲（后台流 / 停止轮半截内容）时先截断再重放，无缝衔接
+        renderHistory(detail.items, running.get(s.id));
         renderWorkspaces(); // 选中已有会话 → 锁定工作区切换
+        // 切回的会话若流式进行中：恢复停止按钮与三项锁定（后台会话不影响本视图）
+        const run = isRunning(currentSessionId);
+        setStopMode(run);
+        wsBtn.disabled = run;
+        modelBtn.disabled = run;
+        permBtn.disabled = run;
         await refreshSessions();
         input.focus();
       };
@@ -2608,14 +2649,15 @@
   // 只重新拉取配置、会话列表和当前会话的消息历史
   document.getElementById('ctxReload').onclick = async () => {
     hideCtxMenu();
-    if (busy) return;
+    // 正在流式的会话不软刷新：半截 checkpoint 会冲掉缓冲补全的实时视图
+    if (isRunning(currentSessionId)) return;
     applyModels(await window.KuribohAgent.getModels());
     await refreshWorkspaces();
     if (currentSessionId) {
       const detail = await window.KuribohAgent.openSession(currentSessionId);
       currentPermission = detail.permission;
       renderPermBtn();
-      renderHistory(detail.items);
+      renderHistory(detail.items, running.get(currentSessionId));
     } else {
       list.innerHTML = '';
     }
@@ -2641,8 +2683,25 @@
     refreshSessions();
   });
 
-  // 把后端返回的历史条目渲染成消息流（assistant 轮复用流式事件渲染逻辑）
-  function renderHistory(items) {
+  // 把后端返回的历史条目渲染成消息流（assistant 轮复用流式事件渲染逻辑）。
+  // entry 为该会话的运行缓冲（后台流 / 停止、出错轮的半截内容）：缓冲覆盖的轮次
+  // 在 checkpoint 里只可能有完整或半截版本，从缓冲首条 user 消息处截断 checkpoint
+  // 再整体重放，避免重复或丢内容
+  function renderHistory(items, entry) {
+    if (entry) {
+      const uts = entry.events.filter((e) => e.type === 'user').map((e) => e.text);
+      let k = uts.length, cut = -1;
+      for (let i = items.length - 1; i >= 0 && k > 0; i--) {
+        if (items[i].role !== 'user') continue;
+        // 从尾向前按文本对齐缓冲轮的 user 消息；对不上的说明该轮 user 消息
+        // 还没写进 checkpoint（superstep 未完成），跳过继续找更早的
+        while (k > 0 && items[i].text !== uts[k - 1]) k--;
+        if (k === 0) break; // 再对不上的是缓冲之前的早期轮次，checkpoint 内容保留
+        cut = i;
+        k--;
+      }
+      if (cut >= 0) items = items.slice(0, cut);
+    }
     list.innerHTML = '';
     for (const it of items) {
       if (it.role === 'user') {
@@ -2660,61 +2719,122 @@
         settlePendingTools(body, true); // 兜底：历史缺结果消息时也收尾工具块
       }
     }
+    if (entry) {
+      // 从缓冲重放：user 伪事件开新气泡，流事件走与实时渲染同一管线（幂等）
+      let body = null;
+      for (const ev of entry.events) {
+        if (ev.type === 'user') {
+          addMsg('user', ev.text).appendChild(el('div', 'md', ev.text));
+          body = addMsg('ai');
+          createThinkPanel(body); // 与 send 一致：先放「正在思考…」占位
+        } else if (body) {
+          handleEvent(ev, body);
+        }
+      }
+      entry.body = body || addMsg('ai'); // 后续事件继续流入最后一个气泡
+    }
     scrollDown();
   }
 
   document.getElementById('newChat').onclick = async () => {
-    if (busy) return;
     await window.KuribohAgent.newSession();
     currentSessionId = null;
     currentPermission = 'workspace'; // 新会话回到默认权限
     renderPermBtn();
     list.innerHTML = '';
+    // 上一视图可能停在流式中的停止按钮/锁定态；新会话视图必然空闲，恢复发送态
+    setStopMode(false);
+    wsBtn.disabled = false;
+    modelBtn.disabled = false;
+    permBtn.disabled = false;
     renderWorkspaces(); // 新会话 → 解锁工作区切换
     await refreshSessions();
     input.focus();
   };
 
+  // 会话进行中发送按钮切换为停止按钮（红色描边方块）
+  function setStopMode(on) {
+    sendBtn.classList.toggle('stop', on);
+    sendBtn.title = on ? '停止' : '发送';
+    sendBtn.innerHTML = on
+      ? '<svg viewBox="0 0 24 24" width="18" height="18"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>'
+      : '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>';
+    // 停止态须保持可点；回到发送态时输入为空则置灰
+    sendBtn.disabled = on ? false : !input.value.trim();
+  }
+
   async function send() {
     const text = input.value.trim();
-    if (!text || busy) return;
-    busy = true;
-    sendBtn.disabled = true;
+    if (!text) return;
+    // 新会话 id 由前端生成：chat 在轮次结束才返回，期间事件已按该 id 路由/缓冲
+    const isNew = currentSessionId === null;
+    const sid = isNew ? crypto.randomUUID() : currentSessionId;
+    if (isRunning(sid)) return;
     hideWsMenu();
     hideModelMenu();
     hidePermMenu();
-    wsBtn.disabled = true; // 流式期间锁定工作区（切换需重建 agent）
+    if (isNew) {
+      currentSessionId = sid;
+      renderWorkspaces(); // 新会话即有归属 → 锁定工作区切换
+    }
+    setStopMode(true);
+    wsBtn.disabled = true; // 本轮流式期间锁定（仅当前会话，后台会话不影响其他视图）
     modelBtn.disabled = true; // 流式期间锁定模型切换
     permBtn.disabled = true; // 流式期间锁定权限切换（拦截规则构建时固化）
     input.value = '';
     addMsg('user', text).appendChild(el('div', 'md', text));
     const body = addMsg('ai');
     createThinkPanel(body); // 占位「正在思考…」；reasoning 到达后转为思考面板
+    // 上一轮停止/出错的半截内容只存在于本缓冲：并入本轮，切回时才能完整重放；
+    // done 轮 checkpoint 已完整落盘，旧缓冲直接丢弃
+    const old = running.get(sid);
+    const events = old && old.finished !== 'done' ? old.events.slice() : [];
+    events.push({ type: 'user', text });
+    const entry = { events, finished: null, body };
+    running.set(sid, entry);
     try {
-      // 流式事件经 window.onKuribohAgentEvent 回调推送，chat 结束即本轮完成
-      window.onKuribohAgentEvent = (ev) => handleEvent(ev, body);
-      const r = await window.KuribohAgent.chat(text);
-      currentSessionId = r ? r.sessionId : currentSessionId;
+      // 事件经全局 routeEvent 按 threadId 分流：当前会话实时渲染进 entry.body
+      await window.KuribohAgent.chat(text, sid);
     } catch (err) {
       body._think?.finish(); // 未收到任何事件：撤掉占位或折叠思考面板
       settlePendingTools(body, false); // 请求失败：未完成的工具块停止脉冲动画
       body.appendChild(el('div', 'error', '请求失败: ' + err.message));
+      entry.finished = 'error';
+      if (isNew && entry.events.length <= 1) {
+        // 一个流事件都没到：后端未建立会话（如未配置模型），回滚新会话状态
+        running.delete(sid);
+        currentSessionId = null;
+        renderWorkspaces();
+      }
     }
-    busy = false;
-    sendBtn.disabled = false;
-    wsBtn.disabled = false;
-    modelBtn.disabled = false;
-    permBtn.disabled = false;
-    input.focus();
-    scrollDown();
+    // 用户可能已切走（currentSessionId 变了）：只在还看着本会话时恢复视图，
+    // 切走的会话由切换逻辑自行设置状态，后台轮结束后台静默收场
+    const stillHere = currentSessionId === sid;
+    if (stillHere) {
+      setStopMode(false);
+      wsBtn.disabled = false;
+      modelBtn.disabled = false;
+      permBtn.disabled = false;
+      input.focus();
+      scrollDown();
+      renderWorkspaces();
+    }
     await refreshSessions(); // 新会话落盘后出现在侧栏
-    renderWorkspaces(); // 首条消息后 currentSessionId 已产生 → 锁定工作区
   }
 
-  sendBtn.onclick = send;
+  // 会话进行中点击即停止当前轮（chat 返回后 send 的收尾逻辑恢复按钮）
+  sendBtn.onclick = () => {
+    if (isRunning(currentSessionId)) window.KuribohAgent.stopChat(currentSessionId).catch(() => {});
+    else send();
+  };
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
+  // 输入为空时发送按钮置灰；停止态不受影响（须可点停止）
+  input.addEventListener('input', () => {
+    if (!sendBtn.classList.contains('stop')) sendBtn.disabled = !input.value.trim();
+  });
+  sendBtn.disabled = true; // 初始输入框为空
 
   // ---------- 工具面板（页面内右侧栏）：开始页 / 工作区文件 / 多终端 ----------
   const toolPanel = document.getElementById('toolPanel');

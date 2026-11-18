@@ -10,7 +10,7 @@
 //     对齐 Linux ro-bind / /），deny ACE 与他人私有文件照常拦得住；
 //   - 写访问走双重校验：普通校验 AND 限制 SID 授权。宿主 DACL 默认不含 Kuriboh SID
 //     的 ACE，故全盘默认禁写；写入白名单靠 grantAcl 把 (OI)(CI)F 授给 Kuriboh SID
-//     （scope 三档：ro 零授权 / ws 工作区 / home 工作区∪%USERPROFILE%，恒含工作区）。
+//     （scope 三档：ro 零授权 / ws 工作区∪语言缓存目录 / home 工作区∪%USERPROFILE%，恒含工作区）。
 // 特权清空封堵 SeBackup/SeTakeOwnership/SeDebug 等绕过 ACL 的路径。
 // 已知取舍（用户确认并文档化）：受限令牌不拦 socket——Windows 沙箱内可联网
 //（Linux/macOS 断网不变）；同 uid 语义下 Everyone 可写目录对沙箱进程同样可写，
@@ -146,9 +146,14 @@ func prepareSandbox(cwd, scope string) (windows.Token, *windows.SID, string, err
 		}
 	case "ro":
 		// 只读档零授权：读全盘天然放行、写全盘天然被拒，无需任何 ACE
-	default: // ws：工作区是沙箱内唯一可写宿主目录
+	default: // ws：工作区 + 各语言缓存目录（cache.go）
 		if err := grantAcl(cwd, sid, fileAllAccess); err != nil {
 			return fail(err)
+		}
+		for _, dir := range langCacheDirs() {
+			if err := grantAcl(dir, sid, fileAllAccess); err != nil {
+				return fail(err)
+			}
 		}
 	}
 	token, err := restrictedToken(sid)

@@ -5,7 +5,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { ChatDeepSeek } from "@langchain/deepseek";
 import { CHECKPOINT_DB, CONFIG_DIR, loadSettings, type AgentConfig, type PermissionLevel, type ProxyConfig, type SearchSettings } from "./config.ts";
-import { createTools, needsConfirm, resolveWorkspacePath } from "./tools.ts";
+import { createTools, needsConfirm, resolveWorkspacePath, sandboxReady } from "./tools.ts";
 import { startWebUI } from "./web.ts";
 import {
   Agent as UndiciAgent,
@@ -96,7 +96,7 @@ const PERMISSION_PROMPTS: Record<PermissionLevel, string> = {
   readonly:
     "当前文件权限为「仅可查看」：读取任意路径的文件无需确认；所有写入、修改操作都会先请用户确认，被拒绝的操作不会执行。",
   workspace:
-    "当前文件权限为「工作区内修改」：工作区内文件可自由读写；工作区外的写入会先请用户确认，被拒绝的操作不会执行。",
+    "当前文件权限为「工作区内修改」：工作区内文件可自由读写；工作区外的写入会先请用户确认，被拒绝的操作不会执行。命令执行（run_command）在 OS 沙箱可用时免确认，其写入被沙箱限制在工作区内；沙箱不可用时修改类命令仍会请用户确认。",
   full: "当前权限为「完全权限」：可以读写计算机上任意路径的文件，执行命令与进程操作同样无需用户确认。",
 };
 
@@ -144,6 +144,8 @@ const READONLY_COMMANDS = new Set([
   "uname", "lscpu", "lsblk", "lspci", "lsusb", "nvidia-smi", "free", "df", "du", "uptime", "w", "who",
   "whoami", "id", "groups", "cal", "hostname", "hostnamectl", "ip", "lsb_release", "printenv",
   "ps", "pgrep", "vmstat", "pwd", "ls", "echo", "printf", "cat", "head", "tail", "wc", "file",
+  // cd 只切换本条一次性 shell 进程的当前目录，进程结束即无痕、无文件写入（set-location 同义）
+  "cd", "set-location",
   // 无副作用控制构件：if/while 条件（test/[）与监控循环（true/false/sleep）的成员
   "true", "false", "sleep", "test", "[",
   "stat", "grep", "egrep", "fgrep", "rg", "cut", "which", "type", "whereis", "netstat", "ss",
@@ -507,12 +509,17 @@ function buildInterruptOn(workspaceDir: string, permission: PermissionLevel): Re
       description: (toolCall) => `${verb}｜${detail(toolCall.args)}`,
     };
   }
-  // run_command 单列一档：完全权限免确认；其余级别下纯只读查询命令（白名单 + 严格词法
-  // 判定）也免确认直接执行——uname / ps / df / cat 配置文件这类系统问询不该每次都打断用户
+  // run_command 单列一档：完全权限免确认；workspace 级 OS 沙箱可用时同样免确认（写入被
+  // 沙箱硬性限制在工作区内，对齐文件工具的工作区内写）；其余场景下纯只读查询命令（白名单 +
+  // 严格词法判定）免确认直接执行——uname / ps / df / cat 配置文件这类系统问询不该每次都打断用户
   interruptOn["run_command"] = {
     allowedDecisions: ["approve", "reject"],
     when: (request) => {
       if (permission === "full") return false;
+      // workspace 级 + OS 沙箱可用：写入已被沙箱硬性限制在工作区内，与文件工具的
+      // 「工作区内写入免确认」约束等同，不逐条确认；沙箱不可用（回退宿主机、无约束）
+      // 与 readonly 级别仍走只读白名单判定
+      if (permission === "workspace" && sandboxReady() === true) return false;
       const command = request.toolCall.args.command;
       return !(typeof command === "string" && isReadOnlyCommand(command));
     },
@@ -531,7 +538,7 @@ export function createKuribohAgent(config: AgentConfig, workspaceDir: string, pe
       "你是一个乐于助人的中文助手。可使用提供的工具（计算、获取时间、文件读写、文件搜索、信息检索、系统命令与进程管理）完成任务和回答问题。" +
       "需要操作本机系统时：run_command 执行命令（查询 CPU、内存、磁盘、网络、进程列表等），process_start 启动程序，process_stop 终止 Kuriboh 启动的进程，open_application 打开应用、文件或网址；" +
       "run_command / process_start 默认在 OS 沙箱内执行（断网、系统目录只读、仅当前工作区可写），沙箱不可用时自动回退宿主机执行并在结果中标注；沙箱内跑不了 GUI 程序，打开应用请用 open_application；" +
-      "这类操作不受工作区与文件权限限制；除「完全权限」模式外，修改类命令与进程操作执行前会先请用户确认（uname、ps、df、cat 配置文件这类纯只读查询命令直接执行），被拒绝后不要换个写法重试；" +
+      "这类操作不受文件权限分级：run_command 在「工作区内修改」权限且 OS 沙箱可用时免确认执行（写入被沙箱限制在工作区内），其余情况下修改类命令执行前会先请用户确认（uname、ps、df、cat 配置文件这类纯只读查询命令始终直接执行）；process_start / process_stop / open_application 除「完全权限」外均逐次确认，被拒绝后不要换个写法重试；" +
       "按文件名或路径模式找文件用 glob_search，在文件内容里找文本用 grep_search，找到路径后再用 read_file 读取；" +
       "文件读写与搜索均在 OS 沙箱内执行（断网、系统目录只读、写入仅限工作区、用户主目录与临时目录）；沙箱不可用或写入越界时这些工具会直接报错失败，不会回退到宿主机执行，失败时如实告知用户原因；" +
       "信息检索时调用一次 web_search 通常已足够，不要对同一问题反复搜索；需要正文时再用 web_fetch 读取具体链接。" +
