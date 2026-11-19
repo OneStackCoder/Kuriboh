@@ -12,7 +12,7 @@ import {
   type MessageContent,
 } from "@langchain/core/messages";
 import { Command } from "@langchain/langgraph";
-import { applyProxy, checkpointer, createMinoAgent, type MinoAgent } from "./agent.ts";
+import { applyProxy, checkpointer, createKuribohAgent, type KuribohAgent } from "./agent.ts";
 import {
   loadModelProfiles,
   saveModelProfiles,
@@ -37,12 +37,14 @@ import {
   type WorkspaceMeta,
   type WorkspacesState,
 } from "./config.ts";
+import { resolveWinShell } from "./tools.ts";
 
 // cwd 由启动器固定为 app 目录（开发模式则为项目根），public/ 与 node_modules/ 均在此目录下
 const ROOT = process.cwd();
 const INDEX_FILE = path.join(ROOT, "public", "index.html");
 // 固定映射表，不开放任意路径读取（防目录穿越）
 const VENDOR: Record<string, readonly [string, string]> = {
+  "/logo.png": [path.join(ROOT, "public", "logo.png"), "image/png"],
   "/vendor/marked.js": [
     path.join(ROOT, "node_modules", "marked", "lib", "marked.umd.js"),
     "application/javascript; charset=utf-8",
@@ -81,6 +83,10 @@ const FONT_MIME: Record<string, string> = {
 };
 
 const PROVIDER_IDS = new Set(MODEL_CATALOG.map((p) => p.id));
+
+// 会话 id（UUID）格式校验：chat 由前端显式传入会话 id（新会话为前端生成的 UUID），
+// 该 id 直接作为 checkpointer 线程键与会话元数据键，必须限制为 UUID 形态
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // 前端可见的模型配置（不含 apiKey）
 interface PublicModelProfile {
@@ -167,7 +173,7 @@ function normalizeConfigInput(
 }
 
 // ---------- 校验前端提交的新增工作区 ----------
-// 相对路径按用户主目录解析（与默认工作区 ~/mino/... 同一基准）；
+// 相对路径按用户主目录解析（与默认工作区 ~/kuriboh/... 同一基准）；
 // 返回 { name, dir }：名称留空时取目录 basename
 function normalizeWorkspaceInput(
   input: unknown
@@ -230,30 +236,49 @@ function normalizeSettingsInput(input: unknown, current: AppSettings): AppSettin
       : NaN;
   const sessionTitleFontSize =
     stInput >= 11 && stInput <= 20 ? stInput : current.sessionTitleFontSize;
-  // 面板宽度由专用 RPC setPanelWidth 维护；普通 setSettings（改主题/代理/字号）不得丢失它
+  // 文件页 / 终端字号：8–24 之间的整数才接受，否则沿用现有值（首次为 undefined，前端用默认 13）
+  const clampPanelFs = (v: unknown, fallback: number | undefined) => {
+    const n = typeof v === "number" && Number.isFinite(v) ? Math.floor(v) : NaN;
+    return n >= 8 && n <= 24 ? n : fallback;
+  };
+  const filesFontSize = clampPanelFs(m.filesFontSize, current.filesFontSize);
+  const termFontSize = clampPanelFs(m.termFontSize, current.termFontSize);
+  // 面板 / 会话栏宽度由专用 RPC 维护；普通 setSettings（改主题/代理/字号）不得丢失它们
   return {
     proxy,
     theme,
     panelWidth: current.panelWidth,
+    sidebarWidth: current.sidebarWidth,
+    chatWidth: current.chatWidth,
     fontSize,
     sessionTitleFontSize,
+    filesFontSize,
+    termFontSize,
     search: m.search === undefined ? current.search : parseSearch(m.search),
   };
 }
 
-// 推送给前端 window.onMinoAgentEvent 的事件（与 public/index.html 约定）
-type UIEvent =
+// 流式渲染事件（runChatStream 内部产生；chat 侧包装时注入所属会话 threadId）
+type StreamEvent =
   | { type: "reasoning_start" }
   | { type: "reasoning_delta"; text: string }
   | { type: "answer_start" }
   | { type: "answer_delta"; text: string }
   | { type: "tool"; name: string; args: unknown }
   | { type: "tool_result"; name: string; text: string }
-  | { type: "config"; provider: string; model: string }
   // 权限确认请求：Agent 暂停等待用户对这批文件操作逐个「允许 / 拒绝」
   | { type: "confirm_request"; calls: Array<{ name: string; args: unknown; description?: string }> }
   | { type: "done" }
+  // 用户点停止：本轮中止，已收到的内容保留（区别于 error）
+  | { type: "stopped" }
   | { type: "error"; message: string };
+
+// 推送给前端 window.onKuribohAgentEvent 的事件（与 public/index.html 约定）。
+// threadId 标记事件所属会话：并发多轮对话时前端按它分流渲染/缓冲；
+// config 是全局 UI 事件（模型快切），不带 threadId
+type UIEvent =
+  | { type: "config"; provider: string; model: string }
+  | ({ threadId: string } & StreamEvent);
 
 // 用户对单个被拦截操作的确认结果（与 langchain HITL Decision 对齐）
 type ConfirmDecision = { type: "approve" } | { type: "reject"; message?: string };
@@ -264,11 +289,13 @@ type RunChatResult =
   | { status: "confirm"; calls: Array<{ name: string; args: unknown; description?: string }> };
 
 interface RunChatStreamParams {
-  agent: MinoAgent;
+  agent: KuribohAgent;
   // 首次调用传新消息；从中断恢复时传 Command({ resume: { decisions } })
   input: { messages: Array<{ role: "user"; content: string }> } | Command<Record<string, unknown>>;
-  push: (ev: UIEvent) => void;
+  push: (ev: StreamEvent) => void;
   threadId: string;
+  // 停止按钮：中止信号，经 RunnableConfig.signal 传给底层模型请求
+  signal?: AbortSignal;
 }
 
 const chunkText = (content: MessageContent): string =>
@@ -302,6 +329,7 @@ async function runChatStream({
   input,
   push,
   threadId,
+  signal,
 }: RunChatStreamParams): Promise<RunChatResult> {
   let pending = "";
   let pendingReasoning = ""; // 思考增量与正文增量各自缓冲，共用一个 60ms 合批定时器
@@ -340,6 +368,7 @@ async function runChatStream({
       configurable: { thread_id: threadId },
       streamMode: ["messages", "updates"],
       recursionLimit: 100,
+      signal,
     });
     let segStarted = false;
     let reasoningStarted = false;
@@ -380,8 +409,9 @@ async function runChatStream({
           for (const intr of updates["__interrupt__"] as Array<{ value?: unknown }>) {
             const v = intr?.value;
             if (v == null || typeof v !== "object") continue;
-            const req = v as { type?: unknown; actionRequests?: unknown };
-            if (req.type !== "human_in_the_loop" || !Array.isArray(req.actionRequests)) continue;
+            // langchain 1.6 的 batched HITL interrupt value 只有 actionRequests/reviewConfigs，无类型标记，按 actionRequests 形状识别
+            const req = v as { actionRequests?: unknown };
+            if (!Array.isArray(req.actionRequests)) continue;
             confirmCalls = req.actionRequests.flatMap((a): Array<{ name: string; args: unknown; description?: string }> => {
               if (a == null || typeof a !== "object") return [];
               const { name, args, description } = a as {
@@ -448,7 +478,7 @@ export interface SessionMeta {
 type HistoryItem =
   | { role: "user"; text: string }
   | { role: "summary"; text: string }
-  | { role: "assistant"; events: UIEvent[] };
+  | { role: "assistant"; events: StreamEvent[] };
 
 function loadSessions(): SessionMeta[] {
   try {
@@ -496,7 +526,7 @@ async function readThreadMessages(threadId: string): Promise<BaseMessage[]> {
 // assistant 的 tool 调用/结果/文本合并为一组 UI 事件，与流式渲染共用同一套展示逻辑
 function historyToItems(messages: BaseMessage[]): HistoryItem[] {
   const items: HistoryItem[] = [];
-  let aiEvents: UIEvent[] | null = null; // 当前 assistant 轮的事件缓冲
+  let aiEvents: StreamEvent[] | null = null; // 当前 assistant 轮的事件缓冲
   const flushAi = () => {
     if (aiEvents && aiEvents.length) items.push({ role: "assistant", events: aiEvents });
     aiEvents = null;
@@ -541,43 +571,43 @@ function historyToItems(messages: BaseMessage[]): HistoryItem[] {
   return items;
 }
 
-// 纯 Webview 方案：页面经 mino:// 自定义协议加载，不走 HTTP、不占端口
-// 前端→原生：window.MinoAgent.*（expose RPC）；原生→前端流式推送：window.onMinoAgentEvent 回调
+// 纯 Webview 方案：页面经 kuriboh:// 自定义协议加载，不走 HTTP、不占端口
+// 前端→原生：window.KuribohAgent.*（expose RPC）；原生→前端流式推送：window.onKuribohAgentEvent 回调
 export function startWebUI(): void {
   (async () => {
     const mod = await import("@webviewjs/webview");
     const Application = mod.Application ?? mod.default?.Application;
     const app = new Application();
-    // Windows 的窗口图标默认取自宿主进程 node.exe。仅靠创建后调 setWindowIcon 在 Windows 上
-    // 仍显示 node 图标，改走创建参数：windowsTaskbarIcon 在注册窗口类时写入 hIcon（标题栏 /
-    // 任务栏共用），创建后再补一次 WM_SETICON 兜底。其余平台忽略该参数
+    // 窗口图标直接传 PNG 字节：Windows 默认继承宿主 node.exe 图标，标题栏/任务栏需
+    // 分别经 setWindowIcon / setTaskbarIcon 覆盖（setTaskbarIcon 仅 Windows 生效）。
+    // Linux 经 GTK 设置的是传统 WM 窗口图标；GNOME Dock/Alt-Tab 按 .desktop 匹配应用、
+    // 不读窗口图标，故 npm start（无 .desktop）时 Dock 仍显示通用图标——环境机制，非调用失效。
     let winIcon: Buffer | null = null;
-    const isWin = process.platform === "win32";
-    if (isWin) {
-      try {
-        winIcon = fs.readFileSync(path.join(ROOT, "public", "icon.png"));
-      } catch {
-        // 图标缺失不影响启动
-      }
+    try {
+      winIcon = fs.readFileSync(path.join(ROOT, "public", "icon.png"));
+    } catch {
+      // 图标缺失不影响启动
     }
+    const isWin = process.platform === "win32";
     const win = app.createBrowserWindow({
-      title: "Mino",
+      title: "Kuriboh",
       width: 1300,
       height: 900,
       logical: true, // 尺寸按逻辑像素解释：HiDPI（scaleFactor=2）下物理像素会被缩放一半
       resizable: true,
-      ...(winIcon ? { windowsTaskbarIcon: { data: winIcon } } : {}),
+      ...(isWin && winIcon ? { windowsTaskbarIcon: { data: winIcon } } : {}),
     });
-    if (isWin && winIcon) {
+    if (winIcon) {
       try {
         win.setWindowIcon(winIcon);
+        win.setTaskbarIcon(winIcon);
       } catch {
-        // 设置失败不阻塞启动，窗口类图标已兜底
+        // 设置失败不阻塞启动，创建参数已兜底
       }
     }
 
     // 注册协议必须在 createWebview 之前
-    win.registerProtocol("mino", async (request) => {
+    win.registerProtocol("kuriboh", async (request) => {
       const { pathname } = new URL(request.url);
       if (pathname === "/" || pathname === "/index.html") {
         return new Response(fs.readFileSync(INDEX_FILE), {
@@ -612,17 +642,19 @@ export function startWebUI(): void {
     // 单一主界面 webview：工具面板是页面内右侧栏，不再需要第二个 webview。
     // 顶层 webview 省略 bounds，可自动填满窗口并跟随 resize
     // Windows 下 WebView2 默认把数据目录建在 node.exe 所在目录（C:\Program Files\nodejs），
-    // 无写权限会直接报「无法读取和写入其数据目录」，改为指向 %LOCALAPPDATA%\Mino
+    // 无写权限会直接报「无法读取和写入其数据目录」，改为指向 %LOCALAPPDATA%\Kuriboh
     let webContext: ReturnType<typeof app.createWebContext> | undefined;
     if (process.platform === "win32") {
       const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
-      const dataDir = path.join(localAppData, "Mino");
+      const dataDir = path.join(localAppData, "Kuriboh");
       fs.mkdirSync(dataDir, { recursive: true });
       webContext = app.createWebContext({ dataDirectory: dataDir });
     }
-    const webview = win.createWebview({ url: "mino://localhost/", webContext });
+    const webview = win.createWebview({ url: "kuriboh://localhost/", webContext });
 
-    // 弹出系统目录选择器：Linux 用 zenity（GTK 原生目录对话框）；其余平台回退为选文件取其所在目录
+    // 弹出系统目录选择器：Linux 用 zenity、macOS 用 osascript、Windows 用
+    // PowerShell 跑 WinForms FolderBrowserDialog（WebView2 无原生目录选择 API）；
+    // 返回选中目录的绝对路径，用户取消返回 null
     const showDirectoryPicker = async (): Promise<string | null> => {
       if (process.platform === "linux") {
         return await new Promise<string | null>((resolve) => {
@@ -637,13 +669,46 @@ export function startWebUI(): void {
           );
         });
       }
-      const files = win.openFileDialog({ title: "请选择目标目录内的任意文件" });
-      return files.length ? path.dirname(files[0]) : null;
+      if (process.platform === "darwin") {
+        return await new Promise<string | null>((resolve) => {
+          execFile(
+            "osascript",
+            ["-e", 'POSIX path of (choose folder with prompt "选择工作区目录")'],
+            (err, stdout) => {
+              if (err) return resolve(null); // 用户取消（osascript 非零退出）
+              resolve(String(stdout).trim() || null);
+            }
+          );
+        });
+      }
+      // -STA：ShowDialog 要求 STA 线程；输出走 [Console]::Out 并切 UTF8，
+      // 防中文路径按 OEM 代码页乱码；windowsHide 防控制台黑框闪烁
+      return await new Promise<string | null>((resolve) => {
+        execFile(
+          "powershell.exe",
+          [
+            "-NoLogo",
+            "-STA",
+            "-NonInteractive",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms;" +
+              "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;" +
+              "$f = New-Object System.Windows.Forms.FolderBrowserDialog;" +
+              "$f.Description = '选择工作区目录';" +
+              "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($f.SelectedPath) }",
+          ],
+          { windowsHide: true },
+          (err, stdout) => {
+            if (err) return resolve(null); // 用户取消或 PowerShell 缺失
+            resolve(String(stdout).trim() || null);
+          }
+        );
+      });
     };
 
     const push = (ev: UIEvent) => {
       if (webview.isDisposed()) return;
-      webview.evaluateScript(`window.onMinoAgentEvent?.(${JSON.stringify(ev)})`);
+      webview.evaluateScript(`window.onKuribohAgentEvent?.(${JSON.stringify(ev)})`);
     };
 
     // 模型配置列表（可存多份，activeId 为当前生效的一份）
@@ -664,16 +729,34 @@ export function startWebUI(): void {
     let agentPermission: PermissionLevel = "workspace"; // 当前 agent 构建时的权限，用于判断是否需要重建
     // 当前 agent 构建时的搜索设置：引擎开关固化在工具集里，变化后需重建（见 syncAgent）
     let agentSearch: SearchSettings = settings.search;
-    let agent: MinoAgent | null = config ? createMinoAgent(config, activeWorkspace().path, permission, settings.search) : null;
+    let agent: KuribohAgent | null = config ? createKuribohAgent(config, activeWorkspace().path, permission, settings.search) : null;
     // 对话进行中改搜索设置 → 挂起，本轮结束后再重建，避免打断待恢复的权限确认流程
     let pendingSearchSync = false;
     // 当前会话线程 id：历史与压缩状态都挂在 checkpointer 的这个线程上
     let threadId: string = crypto.randomUUID();
     let sessions: SessionMeta[] = loadSessions();
-    let sessionSaved = false; // 当前线程是否已写入会话列表（首条消息后写入）
-    let busy = false;
-    // 权限确认等待：chat 挂起等前端 resolveConfirm({ decisions }) 回传后恢复执行
-    let confirmResolver: ((decisions: ConfirmDecision[]) => void) | null = null;
+    // 进行中的对话轮按 threadId 记录（多个会话可并发）：切走会话不打断流，
+    // 停止/确认各自只作用于所属会话
+    interface RunningChat {
+      abort: AbortController;
+      // 权限确认等待：chat 挂起等前端 resolveConfirm({ threadId, decisions }) 回传后恢复执行
+      confirmResolver: ((decisions: ConfirmDecision[]) => void) | null;
+      pendingConfirmCalls: Array<{ name: string; args: unknown; description?: string }>;
+    }
+    const runningChats = new Map<string, RunningChat>();
+    // 停止一轮对话：AbortController 经 signal 传给 agent.stream；若正挂在权限确认上，
+    // 还需以全拒绝回填 decisions 唤醒挂起的 chat，让它被已中止的 signal 立即打断
+    const stopChatByThreadId = (tid: string): boolean => {
+      const run = runningChats.get(tid);
+      if (!run) return false;
+      run.abort.abort();
+      const resolve = run.confirmResolver;
+      if (resolve) {
+        run.confirmResolver = null;
+        resolve(run.pendingConfirmCalls.map(() => ({ type: "reject", message: "用户停止了本轮对话" })));
+      }
+      return true;
+    };
 
     // 工具面板（页面内右侧栏）：文件预览的尺寸限制
     const FILE_PREVIEW_LIMIT = 256 * 1024; // 文本预览上限，超出截断
@@ -732,6 +815,28 @@ export function startWebUI(): void {
       return { name: path.basename(rel), size: stat.size, binary: false, truncated, text };
     };
 
+    // 在系统文件管理器中打开当前浏览目录（解析与 listDir 同一防线，限工作区内）
+    const panelOpenDir = async (rel: string) => {
+      const abs = panelResolvePath(rel);
+      if (!fs.statSync(abs).isDirectory()) throw new Error("这不是一个目录");
+      // 与 open_application 工具同一套打开方式：系统默认程序处理目录即文件管理器
+      const argv =
+        process.platform === "win32"
+          ? ["cmd", "/c", "start", "", abs] // start 的首个引号参数是窗口标题占位，缺省会被 target 占用
+          : process.platform === "darwin"
+            ? ["open", abs]
+            : ["xdg-open", abs];
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(argv[0], argv.slice(1), { detached: true, stdio: "ignore" });
+        child.once("error", reject);
+        child.once("spawn", () => {
+          child.unref(); // 脱离父进程：文件管理器独立于 Kuriboh 运行
+          resolve();
+        });
+      });
+      return { opened: abs };
+    };
+
     // ---------- 工具面板：内嵌终端 ----------
     // 不用 node-pty（免原生编译）：Linux/macOS 用 script 分配伪 PTY（bash/zsh 有完整交互回显），
     // Windows 直接行缓冲 powershell。输出经 base64 推给 window.onTermEvent，输入经 termWrite 回传
@@ -757,6 +862,8 @@ export function startWebUI(): void {
       webview.evaluateScript(`window.onTermEvent?.(${JSON.stringify({ id, ...ev })})`);
     };
 
+    // Windows 终端 shell 用 tools.ts 的 resolveWinShell 解析（装有 PS7 时优先于 5.1）
+
     const termStart = (id: string, cols: number, rows: number): { running: boolean; id: string } => {
       const existing = termSessions.get(id);
       if (existing && !existing.child.killed) return { running: true, id }; // 复用已存活的会话
@@ -769,8 +876,8 @@ export function startWebUI(): void {
       };
       let child: ReturnType<typeof spawn>;
       if (process.platform === "win32") {
-        // windowsHide 防止在 GUI 进程里新建控制台窗口
-        child = spawn("powershell.exe", ["-NoLogo"], { cwd, env, windowsHide: true });
+        // windowsHide 防止在 GUI 进程里新建控制台窗口；装有 pwsh（PowerShell 7+）时优先于 5.1
+        child = spawn(resolveWinShell(), ["-NoLogo"], { cwd, env, windowsHide: true });
       } else {
         // 先在 PTY 内同步窗口尺寸，再 exec 到平台默认 shell
         const shell = process.platform === "darwin" ? "zsh" : "bash";
@@ -878,30 +985,28 @@ export function startWebUI(): void {
         config &&
         (agentPermission !== permission || !sameSearch(agentSearch, settings.search))
       ) {
-        agent = createMinoAgent(config, activeWorkspace().path, permission, settings.search);
+        agent = createKuribohAgent(config, activeWorkspace().path, permission, settings.search);
         agentPermission = permission;
         agentSearch = settings.search;
       }
     };
 
-    // 会话已落盘 → 更新活跃时间；未落盘 → 首条消息定标题并写入列表（带上当前权限）
-    const touchSession = (firstMessage: string) => {
-      const now = Date.now();
-      if (!sessionSaved) {
-        sessionSaved = true;
+    // 会话已落盘 → 更新活跃时间；未落盘 → 首条消息定标题并写入列表（带上发起时的权限）。
+    // tid/perm 由调用方传快照：会话可并发运行，全局 threadId/permission 可能已被切走
+    const touchSession = (firstMessage: string, tid: string, perm: PermissionLevel) => {
+      const meta = sessions.find((s) => s.id === tid);
+      if (meta) {
+        meta.updatedAt = Date.now();
+        meta.permission = perm;
+      } else {
+        const now = Date.now();
         sessions.unshift({
-          id: threadId,
+          id: tid,
           title: firstMessage.replace(/\s+/g, " ").slice(0, 30),
           createdAt: now,
           updatedAt: now,
-          permission,
+          permission: perm,
         });
-      } else {
-        const meta = sessions.find((s) => s.id === threadId);
-        if (meta) {
-          meta.updatedAt = now;
-          meta.permission = permission;
-        }
       }
       persistSessions(sessions);
     };
@@ -918,11 +1023,10 @@ export function startWebUI(): void {
     // 当前配置变化后重建 agent 并开启新会话（旧会话仍保留在历史列表）
     const activateProfile = () => {
       permission = "workspace"; // 新会话回到默认权限
-      agent = config ? createMinoAgent(config, activeWorkspace().path, permission, settings.search) : null;
+      agent = config ? createKuribohAgent(config, activeWorkspace().path, permission, settings.search) : null;
       agentPermission = permission;
       agentSearch = settings.search;
       threadId = crypto.randomUUID();
-      sessionSaved = false;
       if (config) push({ type: "config", provider: config.provider, model: config.model });
     };
 
@@ -984,7 +1088,7 @@ export function startWebUI(): void {
     // expose 的 stub 只注入当前页面，必须等页面加载完成后再注册
     webview.on("page-load-finished", () => {
       // 静态值 catalog/provider/model 同步可读；函数经 RPC 调用，返回值必须可 JSON 序列化
-      webview.expose("MinoAgent", {
+      webview.expose("KuribohAgent", {
         catalog: MODEL_CATALOG,
         provider: config?.provider ?? null,
         model: config?.model ?? null,
@@ -1033,7 +1137,6 @@ export function startWebUI(): void {
             permission = "workspace";
             agentPermission = permission;
             threadId = crypto.randomUUID();
-            sessionSaved = false;
             return state;
           }
           if (wasActive) models.activeId = models.items[0].id;
@@ -1074,9 +1177,9 @@ export function startWebUI(): void {
           saveSettings(next);
           settings = next;
           applyProxy(settings.proxy);
-          // 搜索引擎开关固化在工具集里，变化后需重建 agent；对话进行中挂起到本轮结束
+          // 搜索引擎开关固化在工具集里，变化后需重建 agent；有对话进行中挂起到轮次结束
           if (searchChanged) {
-            if (busy) pendingSearchSync = true;
+            if (runningChats.size > 0) pendingSearchSync = true;
             else syncAgent();
           }
           return settings;
@@ -1092,7 +1195,6 @@ export function startWebUI(): void {
         },
         // ---------- 文件操作权限：按会话独立设置，改完即时重建 agent ----------
         setPermission(input: unknown) {
-          if (busy) throw new Error("上一轮还在处理中");
           const level = typeof input === "string" ? input : "";
           if (!PERMISSION_LEVELS.includes(level as PermissionLevel)) {
             throw new Error("未知的权限级别");
@@ -1117,7 +1219,6 @@ export function startWebUI(): void {
         },
         // 切换工作区：立即生效（重建 agent 绑定新目录的文件工具），会话不中断
         setWorkspace(input: unknown) {
-          if (busy) throw new Error("上一轮还在处理中");
           const id = typeof input === "string" ? input : "";
           const target = workspaces.items.find((w) => w.id === id);
           if (!target) throw new Error("工作区不存在");
@@ -1125,7 +1226,7 @@ export function startWebUI(): void {
             workspaces.activeId = id;
             saveWorkspaces(workspaces);
             if (config) {
-              agent = createMinoAgent(config, target.path, permission, settings.search);
+              agent = createKuribohAgent(config, target.path, permission, settings.search);
               agentPermission = permission;
               agentSearch = settings.search;
             }
@@ -1134,7 +1235,6 @@ export function startWebUI(): void {
         },
         // 新增工作区（目录不存在时自动创建），并切换为活动工作区
         addWorkspace(input: unknown) {
-          if (busy) throw new Error("上一轮还在处理中");
           const { name, dir } = normalizeWorkspaceInput(input);
           if (workspaces.items.some((w) => w.path === dir)) {
             throw new Error("该目录已是工作区");
@@ -1162,7 +1262,7 @@ export function startWebUI(): void {
           workspaces.activeId = item.id;
           saveWorkspaces(workspaces);
           if (config) {
-            agent = createMinoAgent(config, dir, permission, settings.search);
+            agent = createKuribohAgent(config, dir, permission, settings.search);
             agentPermission = permission;
             agentSearch = settings.search;
           }
@@ -1170,7 +1270,6 @@ export function startWebUI(): void {
         },
         // 删除工作区：仅从列表移除（不动磁盘目录）；删的是活动工作区时自动切到剩余的第一个
         deleteWorkspace(input: unknown) {
-          if (busy) throw new Error("上一轮还在处理中");
           const id = typeof input === "string" ? input : "";
           const idx = workspaces.items.findIndex((w) => w.id === id);
           if (idx === -1) throw new Error("工作区不存在");
@@ -1179,7 +1278,7 @@ export function startWebUI(): void {
           if (workspaces.activeId === id) {
             workspaces.activeId = workspaces.items[0].id;
             if (config) {
-              agent = createMinoAgent(config, activeWorkspace().path, permission, settings.search);
+              agent = createKuribohAgent(config, activeWorkspace().path, permission, settings.search);
               agentPermission = permission;
               agentSearch = settings.search;
             }
@@ -1194,6 +1293,9 @@ export function startWebUI(): void {
         readFile(rel: string) {
           return panelReadFile(typeof rel === "string" ? rel : "");
         },
+        openDir(rel: string) {
+          return panelOpenDir(typeof rel === "string" ? rel : "");
+        },
         setPanelWidth(input: unknown) {
           const w =
             typeof input === "number" && Number.isFinite(input)
@@ -1203,6 +1305,26 @@ export function startWebUI(): void {
           settings = { ...settings, panelWidth: w };
           saveSettings(settings);
           return { panelWidth: w };
+        },
+        setSidebarWidth(input: unknown) {
+          const w =
+            typeof input === "number" && Number.isFinite(input)
+              ? Math.floor(input)
+              : NaN;
+          if (!(w >= 200 && w <= 480)) throw new Error("会话栏宽度需在 200 到 480 之间");
+          settings = { ...settings, sidebarWidth: w };
+          saveSettings(settings);
+          return { sidebarWidth: w };
+        },
+        setChatWidth(input: unknown) {
+          const w =
+            typeof input === "number" && Number.isFinite(input)
+              ? Math.floor(input)
+              : NaN;
+          if (!(w >= 450 && w <= 1600)) throw new Error("聊天区宽度需在 450 到 1600 之间");
+          settings = { ...settings, chatWidth: w };
+          saveSettings(settings);
+          return { chatWidth: w };
         },
         // ---------- 工具面板：内嵌终端 ----------
         termOpen(input: unknown) {
@@ -1258,51 +1380,79 @@ export function startWebUI(): void {
           if (!Number.isFinite(cols) || !Number.isFinite(rows)) return { ok: false };
           return termSyncSize(id, cols, rows);
         },
-        async chat(message: string) {
-          if (busy) throw new Error("上一轮还在处理中");
+        async chat(message: string, sessionId?: unknown) {
           if (!message || !message.trim()) throw new Error("消息不能为空");
           if (!agent) throw new Error("尚未配置模型，请先点击右上角「设置」");
-          busy = true;
+          // 会话 id 由前端显式传入：新会话 id 在前端生成，首个流事件起就带 threadId，
+          // 前端无需等本 RPC 返回（轮次结束才返回）即可按会话路由/缓冲事件
+          const tid =
+            typeof sessionId === "string" && SESSION_ID_RE.test(sessionId)
+              ? sessionId
+              : "";
+          if (!tid) throw new Error("会话 id 不合法");
+          // 与前端 currentSessionId 保持同步（deleteSession 靠它判断删除的是否当前会话）；
+          // 后台并发轮各持快照，不受此处改写影响
+          threadId = tid;
+          // 其余取发起时刻快照：会话可并发运行，期间用户可能改权限或换模型
+          // （agent/permission 变），本轮仍归属发起时的配置
+          const myAgent = agent;
+          const myPermission = permission;
+          if (runningChats.has(tid)) throw new Error("该会话仍有进行中的对话");
+          const controller = new AbortController();
+          const run: RunningChat = { abort: controller, confirmResolver: null, pendingConfirmCalls: [] };
+          runningChats.set(tid, run);
+          // 事件带上 tid：前端据此把本会话事件路由到对应视图/缓冲，切走也不丢
+          const pushT = (ev: StreamEvent) => push({ ...ev, threadId: tid });
           try {
-            touchSession(message.trim());
+            touchSession(message.trim(), tid, myPermission);
             // 一轮对话可能被多次权限确认打断：中断 → 等用户 decisions → Command 恢复，直到正常结束
             let input: RunChatStreamParams["input"] = {
               messages: [{ role: "user", content: message.trim() }],
             };
             for (;;) {
-              const result = await runChatStream({ agent, input, push, threadId });
+              const result = await runChatStream({ agent: myAgent, input, push: pushT, threadId: tid, signal: controller.signal });
               if (result.status === "done") break;
-              push({ type: "confirm_request", calls: result.calls });
+              run.pendingConfirmCalls = result.calls;
+              pushT({ type: "confirm_request", calls: result.calls });
               // 挂起等待前端确认；用户逐个允许 / 拒绝后由 resolveConfirm 唤醒
               const decisions = await new Promise<ConfirmDecision[]>((resolve) => {
-                confirmResolver = resolve;
+                run.confirmResolver = resolve;
               });
-              confirmResolver = null;
+              run.confirmResolver = null;
+              run.pendingConfirmCalls = [];
               input = new Command({ resume: { decisions } });
             }
-            push({ type: "done" });
+            pushT({ type: "done" });
           } catch (err) {
-            push({ type: "error", message: err instanceof Error ? err.message : String(err) });
+            // 用户主动停止不算错误：已收到的增量保留，前端打「已停止」标记
+            if (controller.signal.aborted) pushT({ type: "stopped" });
+            else pushT({ type: "error", message: err instanceof Error ? err.message : String(err) });
           } finally {
-            busy = false;
-            confirmResolver = null;
+            runningChats.delete(tid);
             // 对话期间改过搜索设置 → 现在重建 agent 使其生效
             if (pendingSearchSync) {
               pendingSearchSync = false;
               syncAgent();
             }
           }
-          // 返回当前会话 id，供前端把新会话标为「当前」并刷新侧栏
-          return { sessionId: threadId };
+          // 返回本轮会话 id，供前端把新会话标为「当前」并刷新侧栏
+          return { sessionId: tid };
+        },
+        // 停止一轮对话（切走会话后流仍在后台跑，按 threadId 定向停止）：
+        // 中断流式请求；若正挂在权限确认上，以全拒绝唤醒后一并中止
+        stopChat(input: unknown) {
+          const tid = typeof input === "string" ? input : "";
+          return tid ? stopChatByThreadId(tid) : false;
         },
         // 用户在确认卡片上点完「允许 / 拒绝」后回传，唤醒挂起的对话
         resolveConfirm(input: unknown) {
-          const resolve = confirmResolver;
-          if (!resolve) throw new Error("当前没有等待确认的操作");
           const m =
             typeof input === "object" && input !== null
               ? (input as Record<string, unknown>)
               : {};
+          const run = runningChats.get(typeof m.threadId === "string" ? m.threadId : "");
+          const resolve = run?.confirmResolver;
+          if (!run || !resolve) throw new Error("当前没有等待确认的操作");
           const raw = Array.isArray(m.decisions) ? (m.decisions as unknown[]) : [];
           if (!raw.length) throw new Error("确认结果不能为空");
           const decisions = raw.map((d): ConfirmDecision => {
@@ -1319,7 +1469,7 @@ export function startWebUI(): void {
             }
             throw new Error("无效的确认结果");
           });
-          confirmResolver = null;
+          run.confirmResolver = null;
           resolve(decisions);
           return { ok: true };
         },
@@ -1327,24 +1477,22 @@ export function startWebUI(): void {
         async listSessions() {
           return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
         },
-        // 开启新对话：换新线程，旧对话保留在历史列表；新会话回到默认权限
+        // 开启新对话：换新线程，旧对话保留在历史列表（旧线程若仍在流式运行则后台继续）；
+        // 新会话回到默认权限
         async newSession() {
-          if (busy) throw new Error("上一轮还在处理中");
           threadId = crypto.randomUUID();
-          sessionSaved = false;
           permission = "workspace";
           syncAgent();
           return { permission };
         },
-        // 打开历史会话：切换线程、恢复该会话的权限并回放全部消息（从 checkpointer 读取）
+        // 打开历史会话：切换线程、恢复该会话的权限并回放全部消息（从 checkpointer 读取）。
+        // 目标会话若有进行中的流则继续后台运行，前端用其缓冲补渲染
         async openSession(input: unknown) {
-          if (busy) throw new Error("上一轮还在处理中");
           const id = typeof input === "string" ? input : "";
           const meta = sessions.find((s) => s.id === id);
           if (!meta) throw new Error("会话不存在");
           const messages = await readThreadMessages(id);
           threadId = id;
-          sessionSaved = true;
           permission = meta.permission;
           syncAgent();
           return {
@@ -1369,19 +1517,19 @@ export function startWebUI(): void {
           persistSessions(sessions);
           return { id: meta.id, title: meta.title };
         },
-        // 删除会话：移除元数据并清理 checkpointer 里的消息本体
+        // 删除会话：移除元数据并清理 checkpointer 里的消息本体；
+        // 该会话若仍在流式运行（含挂在权限确认上），先定向停止再删
         async deleteSession(input: unknown) {
-          if (busy) throw new Error("上一轮还在处理中");
           const id = typeof input === "string" ? input : "";
           const idx = sessions.findIndex((s) => s.id === id);
           if (idx === -1) return { cleared: false };
+          stopChatByThreadId(id);
           sessions.splice(idx, 1);
           persistSessions(sessions);
           await checkpointer.deleteThread(id);
           if (threadId === id) {
             // 删除的是当前会话：换新线程，前端需清空消息区；回到默认权限
             threadId = crypto.randomUUID();
-            sessionSaved = false;
             permission = "workspace";
             syncAgent();
             return { cleared: true };
@@ -1395,7 +1543,7 @@ export function startWebUI(): void {
     win.on("close", () => process.exit(0));
     // app.run() 内部用 setInterval 泵原生事件，不阻塞 Node 事件循环
     app.run();
-    console.log("已打开 Mino 窗口，关闭窗口即可退出");
+    console.log("已打开 Kuriboh 窗口，关闭窗口即可退出");
   })().catch((err) => {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`打开窗口失败: ${message.split("\n")[0]}`);

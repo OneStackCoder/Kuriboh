@@ -27,8 +27,8 @@ func promptMissingApp(path string) {
 // 双击启动时没有终端，优先用桌面弹窗；弹窗不可用时退回 stderr
 func notify(msg string) {
 	dialogs := [][]string{
-		{"zenity", "--info", "--title", "Mino", "--text", msg},
-		{"kdialog", "--title", "Mino", "--msgbox", msg},
+		{"zenity", "--info", "--title", "Kuriboh", "--text", msg},
+		{"kdialog", "--title", "Kuriboh", "--msgbox", msg},
 	}
 	for _, args := range dialogs {
 		if _, err := exec.LookPath(args[0]); err != nil {

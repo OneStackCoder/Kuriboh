@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/icon.svg" alt="Mino logo" width="96">
+  <img src="assets/icon.svg" alt="Kuriboh logo" width="200">
 </p>
 
-# Mino
+# Kuriboh
 
-<img src="screenshot.png" alt="Mino 截图" width="720">
+<img src="screenshot.png" alt="Kuriboh 截图" width="720">
 
 基于 LangChain.js 的桌面 AI Agent：原生 webview 窗口，轻量无 Electron，启动即用。Node.js ≥ 24 直接运行 ，零构建步骤。
 
@@ -20,15 +20,18 @@
 
 | 平台      | 必需                                   | 可选 / 说明                                                            |
 | ------- | ------------------------------------ | ------------------------------------------------------------------ |
-| Linux   | WebKitGTK 4.1、`libxdo`、X11 或 Wayland | `zenity`：目录选择器；`script`（util-linux）：内嵌终端伪 PTY；`stty`：终端尺寸同步；`bash` |
-| Windows | WebView2 Runtime、PowerShell          | Win11 与新版 Edge 自带 WebView2，Win10 缺失时会弹窗引导安装                        |
+| Linux   | WebKitGTK 4.1、`libxdo`、X11 或 Wayland | `zenity`（目录选择器）、`script` / `stty` / `bash`（内嵌终端）、`bubblewrap`（OS 沙箱，缺失时文件工具与「完全权限」外的系统命令停用、不回退宿主机） |
+| Windows | WebView2 Runtime、PowerShell          | Win11 自带 WebView2，Win10 缺失时弹窗引导；终端优先 PowerShell 7+，否则系统 5.1（无 PTY，Tab 补全等不可用）；窗口图标已覆盖 node.exe 默认 |
 | macOS   | 11 及以上（系统自带 WebKit）                  | `script`、`pgrep` / `ps`：终端尺寸同步                                     |
 
 Debian / Ubuntu 安装示例（包名因发行版而异）：
 
 ```bash
-sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux
+sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux bubblewrap
 ```
+
+### 沙箱安全
+沙箱的技术原理、平台实现与安全边界详见 [README-sandbox.md](README-sandbox.md)。
 
 ## 运行
 
@@ -36,7 +39,7 @@ sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux
 npm install
 npm start                # 打开对话窗口（在「设置 → 模型」里添加模型配置）
 npm run typecheck        # tsc --noEmit 类型检查
-npm run build:local      # 打包到 build/app，并编译本平台 launcher 到 build/（需 Go）
+npm run build:local      # 编译 kuriboh-sandbox sidecar，打包到 build/app，并编译本平台 launcher 到 build/（需 Go）
 ```
 
 支持 OpenAI / Anthropic / DeepSeek 及任意 OpenAI 兼容接口（Moonshot、智谱、本地网关等）。
@@ -54,10 +57,10 @@ npm run build:local      # 打包到 build/app，并编译本平台 launcher 到
 | Claude Code           | 接近上限自动压缩（约 92%），`/compact` 手动压缩；配合工具输出截断、子代理隔离                          |
 | Cursor                | `/compact` 手动摘要；接近上限时自动浓缩旧对话                                            |
 | Cline / Roo Code      | 滑动窗口截断 ＋ auto-compact 把历史浓缩成摘要后开新上下文                                    |
-| LangChain / LangGraph | `trimMessages` 滑窗截断；`summarizationMiddleware` 摘要压缩（Mino 在用）             |
-| **Mino（本项目）**         | `summarizationMiddleware`：token 估算 ≥ 16,000 触发，旧消息 → 一条摘要，保留最近 20 条，全自动 |
+| LangChain / LangGraph | `trimMessages` 滑窗截断；`summarizationMiddleware` 摘要压缩（Kuriboh 在用）             |
+| **Kuriboh（本项目）**         | `summarizationMiddleware`：token 估算 ≥ 16,000 触发，旧消息 → 一条摘要，保留最近 20 条，全自动 |
 
-### Mino 的实现
+### Kuriboh 的实现
 
 配置在 [src/agent.ts](src/agent.ts)：
 

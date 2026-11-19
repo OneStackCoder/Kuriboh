@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-Mino 是一个桌面 AI Agent：Node.js 进程内跑 LangChain.js Agent，用原生 webview（Linux WebKitGTK / Windows WebView2 / macOS WKWebView）承载单页 UI，Go 写的 `launcher/` 只负责开窗口和打包。
+Kuriboh 是一个桌面 AI Agent：Node.js 进程内跑 LangChain.js Agent，用原生 webview（Linux WebKitGTK / Windows WebView2 / macOS WKWebView）承载单页 UI，Go 写的 `launcher/` 只负责开窗口和打包，Go 写的 `sandbox/` 编译出 `kuriboh-sandbox` sidecar 承载系统命令与文件工具的 OS 沙箱。
 
 ## 运行与验证
 
@@ -12,32 +12,34 @@ Mino 是一个桌面 AI Agent：Node.js 进程内跑 LangChain.js Agent，用原
 npm install
 npm start          # 直接运行 TypeScript（Node ≥ 24 原生类型剥离，无编译步骤）
 npm run typecheck  # tsc --noEmit，改完 TS 必须跑
-npm run build      # esbuild 打包成 build/app/app.mjs，并复制、压缩 public/（仅发布用）
+npm run build:sandbox  # 编译 sandbox/ 的 Go sidecar 到项目根 kuriboh-sandbox（需 Go ≥ 1.21）
+npm run build      # 先编 sidecar，再 esbuild 打包成 build/app/app.mjs，复制、压缩 public/（仅发布用）
 ```
 
 没有测试框架。行为改动需说明手动验证路径（如 `npm start` 后点终端、执行 `exit` 观察页签行为）；无法验证时明确说明，不要声称已验证。
 
 ## 目录职责
 
-- `src/agent.ts`：`createMinoAgent(config, workspaceDir, permission)` 构建 Agent、模型工厂、权限提示词、工具拦截。
+- `src/agent.ts`：`createKuribohAgent(config, workspaceDir, permission)` 构建 Agent、模型工厂、权限提示词、工具拦截。
 - `src/config.ts`：配置读写、`CONFIG_DIR`、`DEFAULT_WORKSPACE_DIR`、`PermissionLevel` 等唯一来源。
-- `src/tools.ts`：LangChain 工具（read/write/list、glob_search/grep_search 文件与内容搜索（globby + @vscode/ripgrep）、calculator、时间、web_search 统一搜索、网页抓取）。搜索默认用当前模型商的搜索能力（复用其 API Key：智谱、DeepSeek 有独立搜索端点，OpenAI 经 Responses API 内置 web_search 适配）；`settings.json` 的 search 可多选启用付费引擎（bocha 博查 / serpapi，后者内部固定先 Google 后 Brave 级联），`engineOrder` 定义的卡片顺序即优先级——第一个失败自动尝试下一个，再回落模型商搜索。
-- `src/web.ts`：webview 宿主、`window.MinoAgent` RPC、事件推送、静态资源白名单、内嵌终端后端。
+- `src/tools.ts`：LangChain 工具（read/write/edit/list、glob_search/grep_search 文件与内容搜索（统一用捆绑 @vscode/ripgrep）、calculator、时间、web_search 统一搜索、网页抓取、run_command / process_start / process_stop 系统命令与进程管理、open_application 打开应用/文件/网址（run_command / process_start 不做命令语义分析、免确认，写入 containment 由 `kuriboh-sandbox` sidecar 按 OS 沙箱在执行层硬性保证：readonly=ro 档、workspace=ws 档、full=宿主机直跑，非 full 级沙箱不可用一律硬失败不回退；process_stop 免确认、仅可终止 Kuriboh 启动的进程；open_application 在宿主机执行、完全权限外逐次确认；六个文件工具同样全部经 sidecar 进 OS 沙箱执行，沙箱不可用一律硬失败不回退））。搜索默认用当前模型商的搜索能力（复用其 API Key：智谱、DeepSeek 有独立搜索端点，OpenAI 经 Responses API 内置 web_search 适配）；`settings.json` 的 search 可多选启用付费引擎（bocha 博查 / serpapi，后者内部固定先 Google 后 Brave 级联），`engineOrder` 定义的卡片顺序即优先级——第一个失败自动尝试下一个，再回落模型商搜索。
+- `src/web.ts`：webview 宿主、`window.KuribohAgent` RPC、事件推送、静态资源白名单、内嵌终端后端。
 - `public/index.html`：全部前端（原生 JS，单文件，无构建）。
 - `launcher/`：Go 启动器（开窗、目录选择、打包校验）。
+- `sandbox/`：Go sidecar `kuriboh-sandbox`（`build:sandbox` 产出）：run_command / process_start 与文件工具的 OS 沙箱后端，Linux=bubblewrap+Landlock、Windows=受限访问令牌+ACL（macOS=Seatbelt / sandbox-exec，编译级验证、待真机实测）。
 - `assets/`：图标源文件与各尺寸产物。
 - `.github/workflows/build.yml`：三平台打包。
 
 ## 硬性约定
 
-1. **品牌与命名**：产品名 `Mino`，代码标识 `MinoAgent`，默认工作区 `~/mino/default_workspace`，配置目录 `~/.config/Mino`，协议 `mino://`。不要再引入 `GoAgent` / `goagent` 字样。
-2. **RPC 契约**：后端只通过 `webview.expose("MinoAgent", ...)` 暴露接口，前端只调 `window.MinoAgent.*`；事件走 `window.onMinoAgentEvent` / `onTermEvent`。新增方法必须返回可 JSON 序列化的值，并且前后端同时改。
-3. **路径集中管理**：配置目录、工作区默认值只能来自 `src/config.ts` 的常量，禁止在别处拼 `~/.config/Mino` 之类的字面量。用户已有 `workspaces.json` 不迁移。
-4. **权限模型不能绕过**：`readonly` / `workspace` / `full` 三级，读操作免确认，写操作经 `needsConfirm` + `humanInTheLoopMiddleware` 拦截。新增文件工具必须走 `resolveWorkspacePath`，不得提供绕过权限检查的写路径或任意 shell 执行工具。
-5. **Agent 重建而非原地改**：配置、工作区、权限变化后调用 `createMinoAgent` 重新构建（见 `syncAgent`），不要直接改运行中 agent 的状态。
+1. **品牌与命名**：产品名 `Kuriboh`，代码标识 `KuribohAgent`，默认工作区 `~/kuriboh/default_workspace`，配置目录 `~/.config/Kuriboh`，协议 `kuriboh://`。不要再引入 `GoAgent` / `goagent` 字样。
+2. **RPC 契约**：后端只通过 `webview.expose("KuribohAgent", ...)` 暴露接口，前端只调 `window.KuribohAgent.*`；事件走 `window.onKuribohAgentEvent` / `onTermEvent`。新增方法必须返回可 JSON 序列化的值，并且前后端同时改。
+3. **路径集中管理**：配置目录、工作区默认值只能来自 `src/config.ts` 的常量，禁止在别处拼 `~/.config/Kuriboh` 之类的字面量。用户已有 `workspaces.json` 不迁移。
+4. **权限模型不能绕过**：`readonly` / `workspace` / `full` 三级，读操作免确认，写操作经 `needsConfirm` + `humanInTheLoopMiddleware` 拦截。新增文件工具必须走 `resolveWorkspacePath`，不得提供绕过权限检查的写路径。六个文件工具（read_file / write_file / edit_file / list_directory / glob_search / grep_search；edit_file 为 read+write 组合，写回走 write 同一 scope）一律经 sidecar 在 OS 沙箱内执行，沙箱不可用一律硬失败不回退；写入 containment 由 OS 按 ro/ws/home 三档硬性保证（封 symlink 逃逸；Linux 为 bwrap + Landlock 双层防线），确认后的区外写也仅限 HOME、临时目录与语言缓存目录。系统命令与进程操作不做命令语义分析（对齐 DSH 设计：沙箱权限与用户审批分开管理，写入 containment 全部放执行层，不预判命令读写哪些文件）：`run_command` / `process_start` 免确认，按权限级别路由——`readonly` 在 OS 沙箱 `ro` 档（全盘只读）执行，`workspace` 在 `ws` 档执行（写入硬性限制在工作区、临时目录与各语言缓存目录（`sandbox/cache.go`）内），`full` 不经沙箱直接在宿主机执行（沙箱全盘只读、仅白名单目录可写、读取不限工作区且三平台全盘可读；网络不隔离：Linux bwrap 不加 `--unshare-net`、macOS Seatbelt 不 `deny network*`、Windows 受限令牌不拦 socket（go mod tidy 等包管理命令需联网拉依赖），三平台沙箱内命令进程可联网、属已确认取舍）；前两级沙箱不可用（sidecar 缺失 / probe 失败 / 运行时 125+marker）一律硬失败不回退宿主机（与文件工具同语义：写路径宁可失败不可越权）；`process_stop` 免确认，仅允许终止 Kuriboh 启动的进程（`managedPids` 白名单）；打开 GUI 应用/文件/网址一律用 `open_application` 在宿主机执行（沙箱内无显示服务），`full` 外逐次经用户确认。
+5. **Agent 重建而非原地改**：配置、工作区、权限变化后调用 `createKuribohAgent` 重新构建（见 `syncAgent`），不要直接改运行中 agent 的状态。
 6. **终端实现**：不引入 `node-pty`。Linux 用 `script -qec` + `stty`，macOS 用 `script -q /dev/null`，Windows 用 PowerShell。退出事件语义要和前端保持一致：`code === 0` 关闭页签，非 0 / 启动失败保留提示条。
-7. **前端零依赖新增**：`public/index.html` 内联所有 JS/CSS，不引入框架、不加 CDN（应用离线运行且走 `mino://` 白名单）。模型输出必须经 `DOMPurify.sanitize(marked.parse(...))` 再插入 DOM。渲染所需第三方资源要登记到 `src/web.ts` 的 `VENDOR` 白名单。
-8. **平台与打包**：`npm run build` 用 esbuild 把源码与 JS 依赖（`--packages=bundle`）打成单个 `app.mjs`，只有 `better-sqlite3`、`@webviewjs/webview*`、`@vscode/ripgrep` 保持 external；打包时只复制运行时必需的少量 `node_modules`（原生模块 + `VENDOR` 引用的前端静态资源），新增运行时依赖必须同步 `build.yml` 的 `stage_runtime_deps`。原生依赖按平台在 CI 各自 `npm ci` 获取，新增时需确认三个矩阵平台（linux-x64、darwin-arm64、win32-x64）都有可用产物，控制体积。
+7. **前端零依赖新增**：`public/index.html` 内联所有 JS/CSS，不引入框架、不加 CDN（应用离线运行且走 `kuriboh://` 白名单）。模型输出必须经 `DOMPurify.sanitize(marked.parse(...))` 再插入 DOM。渲染所需第三方资源要登记到 `src/web.ts` 的 `VENDOR` 白名单。
+8. **平台与打包**：`npm run build` 用 esbuild 把源码与 JS 依赖（`--packages=bundle`）打成单个 `app.mjs`，只有 `better-sqlite3`、`@webviewjs/webview*`、`@vscode/ripgrep` 保持 external；打包时只复制运行时必需的少量 `node_modules`（原生模块 + `VENDOR` 引用的前端静态资源），新增运行时依赖必须同步 `build.yml` 的 `stage_runtime_deps`。原生依赖按平台在 CI 各自 `npm ci` 获取，新增时需确认三个矩阵平台（linux-x64、darwin-arm64、win32-x64）都有可用产物，控制体积。Go sidecar `kuriboh-sandbox` 由 `npm run build`（先跑 `sandbox/build.mjs`，需 Go ≥ 1.21）在 runner 本机平台编译，三平台打包分支各复制一份进 app 目录——launcher 以 app 目录为 node 进程 cwd，Node 按 `process.cwd()` 定位 sidecar，二者必须同目录。
 9. **安全红线**：不打印、不提交 API Key；密钥只存在用户配置目录；不新增会上传用户文件或会话内容的逻辑。
 
 ## 代码风格

@@ -23,7 +23,7 @@ await build({
   format: "esm",
   target: "node20",
   packages: "bundle",
-  // better-sqlite3 / @webviewjs/webview* 是原生模块，@vscode/ripgrep 运行时动态解析平台二进制包，均不打包（globby 为纯 JS，会打进 bundle）
+  // better-sqlite3 / @webviewjs/webview* 是原生模块，@vscode/ripgrep 运行时动态解析平台二进制包，均不打包
   external: ["better-sqlite3", "@webviewjs/webview", "@webviewjs/webview-*", "@vscode/ripgrep"],
   banner: {
     js: "import { createRequire as __createRequire } from 'node:module'; const require = __createRequire(import.meta.url);",
@@ -81,7 +81,7 @@ if (local) {
     windows ? "junction" : "dir",
   );
 
-  const bin = windows ? "Mino.exe" : "Mino";
+  const bin = windows ? "Kuriboh.exe" : "Kuriboh";
   const result = spawnSync("go", ["build", "-ldflags", windows ? "-s -w -H windowsgui" : "-s -w", "-o", `../build/${bin}`, "."], {
     cwd: "launcher",
     stdio: "inherit",

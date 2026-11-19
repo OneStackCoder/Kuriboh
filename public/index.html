@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Mino</title>
+<title>Kuriboh</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   /* 作者样式里的 display:flex 会覆盖 hidden 属性的 UA 默认 display:none，
@@ -44,6 +44,7 @@
     --dir-color: #d9a94e;
     --font-size: 16px;
     --session-title-size: 13px;
+    --chat-max: 860px; /* 聊天内容（消息 + 输入框）最大宽度，拉伸条拖拽时 JS 改写 */
   }
   .dark {
     color-scheme: dark;
@@ -101,6 +102,10 @@
   }
   #newChat:hover { background: var(--accent-soft); border-color: var(--accent); }
   #sessions { flex: 1; overflow-y: auto; padding: 0 8px; }
+  /* 全局固定细滚动条：WebKit 默认 overlay 滚动条悬停会变粗（xterm 有自己的更具体规则，不受影响） */
+  ::-webkit-scrollbar { width: 3px; height: 3px; }
+  ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 2px; }
+  ::-webkit-scrollbar-track { background: transparent; }
   #sessionSearchWrap { position: relative; margin: 0 12px 10px; }
   #sessionSearchWrap svg {
     position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
@@ -166,16 +171,16 @@
     display: flex; flex-direction: row;
     background: var(--panel); border-left: 1px solid var(--border);
     min-height: 0; overflow: hidden;
+    --files-fs: 13px; /* 文件页字号（Ctrl+滚轮缩放，JS 动态改写） */
   }
-  #panelDrag {
+  #panelDrag, #sideDrag {
     width: 6px; flex-shrink: 0; cursor: col-resize; position: relative;
     user-select: none; -webkit-user-select: none;
   }
-  #panelDrag::after {
-    content: ''; position: absolute; left: 2px; top: 0; bottom: 0; width: 2px;
-    background: var(--border-strong); border-radius: 1px;
-  }
-  #panelDrag:hover::after, #panelDrag.on::after { background: var(--accent); }
+  /* 负 margin 让热区重叠在相邻面板边缘上，不占布局空间；
+     分隔条自身不画线，边界由侧栏 / 面板自带的 1px 边框承担 */
+  #sideDrag { margin-left: -6px; z-index: 5; }
+  #panelDrag { margin-right: -6px; z-index: 5; }
   body.panel-resizing { cursor: col-resize; }
   body.panel-resizing #main, body.panel-resizing #sidebar { pointer-events: none; }
   body.panel-resizing * { user-select: none; -webkit-user-select: none; }
@@ -237,17 +242,19 @@
   .crumb.cur { color: var(--text); font-weight: 600; cursor: default; }
   .crumb.cur:hover { background: transparent; }
   .crumb-sep { color: var(--text-3); user-select: none; }
-  #refreshBtn {
-    margin-left: auto; width: 24px; height: 24px; flex-shrink: 0;
+  #crumbs button {
+    width: 24px; height: 24px; flex-shrink: 0;
     display: inline-flex; align-items: center; justify-content: center;
     border: none; border-radius: 6px; background: transparent;
     color: var(--text-3); cursor: pointer; line-height: 0;
   }
-  #refreshBtn:hover { color: var(--text); background: var(--hover); }
+  #crumbs button:hover { color: var(--text); background: var(--hover); }
+  #openDirBtn { margin-left: auto; }
+  #refreshBtn { margin-left: 4px; }
   #fileList { flex: 1; overflow-y: auto; padding: 6px; }
   .frow {
     display: flex; align-items: center; gap: 8px;
-    padding: 6px 8px; border-radius: 8px; cursor: pointer; font-size: 13px;
+    padding: 6px 8px; border-radius: 8px; cursor: pointer; font-size: var(--files-fs, 13px);
   }
   .frow:hover { background: var(--hover); }
   .frow .ico { display: inline-flex; color: var(--text-3); flex-shrink: 0; }
@@ -275,7 +282,7 @@
   #pvMeta { color: var(--text-3); font-size: 11px; white-space: nowrap; margin-left: auto; }
   #pvBody {
     flex: 1; overflow: auto; padding: 10px 12px;
-    font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.6;
+    font-family: ui-monospace, Consolas, monospace; font-size: calc(var(--files-fs, 13px) - 1px); line-height: 1.6;
     background: var(--code-bg); color: var(--text);
     white-space: pre-wrap; overflow-wrap: break-word; word-break: break-all;
   }
@@ -314,7 +321,15 @@
   .ptab .ptab-close:hover { color: var(--text); background: var(--border-strong); }
   #newTermBtn { padding: 0 9px; }
   /* ---------- 右侧：对话主区 ---------- */
-  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+  /* 聊天区左右拉伸条：贴 #main 内缘的隐形热区（与 #sideDrag 同风格），拖动调内容最大宽度 */
+  #chatDragL, #chatDragR {
+    position: absolute; top: 0; bottom: 0; width: 6px;
+    cursor: col-resize; z-index: 5;
+  }
+  /* 贴内容边缘而非聊天区边缘，与侧栏 / 面板分隔条的热区错开；max(6px) 保证永不与它们相邻 */
+  #chatDragL { left: max(6px, calc((100% - var(--chat-max)) / 2 - 6px)); }
+  #chatDragR { right: max(6px, calc((100% - var(--chat-max)) / 2 - 6px)); }
   header {
     display: flex; align-items: center; gap: 12px;
     padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
@@ -328,7 +343,7 @@
   #toolPanelBtn:hover { background: var(--hover); color: var(--text); }
   #toolPanelBtn.active { color: var(--accent); background: var(--accent-soft); }
   #chat { flex: 1; overflow-y: auto; padding: 20px; }
-  #chat .inner { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+  #chat .inner { max-width: var(--chat-max); margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
   .msg { display: flex; flex-direction: column; }
   .msg .body {
     max-width: 86%; padding: 10px 14px; border-radius: 12px;
@@ -391,6 +406,12 @@
     font-size: 11px; line-height: 1.7;
     background: var(--tool-bg); border: 1px solid var(--tool-border); color: var(--tool-color);
   }
+  /* 用户批准的 run_command：工具块头上的「已批准」小徽标 */
+  .tool-block-head .tool-approved {
+    flex: none; padding: 0 7px; border-radius: 999px;
+    font-size: 11px; line-height: 1.7; white-space: nowrap;
+    color: var(--ok); background: var(--ok-soft);
+  }
   .tool-block-head .tool-summary {
     flex: 0 1 auto; min-width: 0; max-width: 44em; color: var(--text-4);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -446,6 +467,7 @@
     border: 1px dashed var(--border-strong); border-radius: 6px; padding: 2px 8px; margin-bottom: 6px;
   }
   .error { color: var(--danger); }
+  .stopped-tag { font-size: 12px; color: var(--text-3); }
   .md p { margin: 0 0 8px; } .md p:last-child { margin-bottom: 0; }
   .md pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
   .md code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
@@ -457,7 +479,7 @@
   /* ---------- 输入区（DeepSeek 风格：圆角容器 + 胶囊工具 + 圆形发送按钮） ---------- */
   footer { padding: 12px 20px 18px; background: var(--bg); }
   .input-box {
-    max-width: 860px; margin: 0 auto;
+    max-width: var(--chat-max); margin: 0 auto;
     background: var(--panel); border: 1px solid var(--border-strong); border-radius: 16px;
     padding: 10px 12px 8px;
     box-shadow: 0 1px 3px rgba(0, 0, 0, .04);
@@ -492,6 +514,9 @@
   #modelBtn { margin-left: auto; }
   #send:hover { background: var(--accent-hover); }
   #send:disabled { background: var(--accent-disabled); cursor: not-allowed; }
+  /* 会话进行中按钮切换为停止态：红色描边方块，保持可点击 */
+  #send.stop { background: transparent; color: var(--danger); border: 1.5px solid var(--danger); }
+  #send.stop:hover { background: var(--danger); color: #fff; }
   /* 工作区下拉菜单（复用 .ctx-menu 的定位容器样式） */
   .ws-menu { min-width: 260px; max-width: 340px; }
   .ws-list { max-height: 280px; overflow-y: auto; padding: 4px; }
@@ -689,7 +714,7 @@
     display: flex; align-items: center; justify-content: center;
   }
   .about-head { display: flex; align-items: center; gap: 14px; }
-  .about-logo { width: 56px; height: 56px; flex: none; }
+  .about-logo { width: 86px; height: 86px; flex: none; background-color: #ffffff; }
   .about-name { font-size: 20px; font-weight: 700; color: var(--text); line-height: 1.2; }
   .about-desc { font-size: 13px; color: var(--text-2); line-height: 1.7; margin: 4px 0 0; }
   .about-link {
@@ -733,7 +758,7 @@
 </head>
 <body>
 <aside id="sidebar">
-  <div class="side-head">Mino</div>
+  <div class="side-head">Kuriboh</div>
   <button id="newChat" title="开启新的对话">＋ 开启新对话</button>
   <div id="sessionSearchWrap">
     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
@@ -748,12 +773,15 @@
     <div>会话保存在本机，重启后可继续</div>
   </div>
 </aside>
+<div id="sideDrag"></div>
 <!-- 会话右键菜单（重命名 / 重新加载） -->
 <div id="ctxMenu" class="ctx-menu">
   <div class="ctx-item" id="ctxRename">重命名</div>
   <div class="ctx-item" id="ctxReload">重新加载</div>
 </div>
 <div id="main">
+  <div id="chatDragL" title="拖动调整聊天区宽度"></div>
+  <div id="chatDragR" title="拖动调整聊天区宽度"></div>
   <header>
     <span id="model"></span>
     <button id="toolPanelBtn" title="打开工具面板" aria-label="打开工具面板"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
@@ -785,7 +813,7 @@
 </div>
 <!-- 右侧：工具面板（页面内右侧栏，侧栏「工具面板」按钮开关） -->
 <div id="toolPanel" hidden>
-  <div id="panelDrag" title="拖动调整面板宽度"></div>
+  <div id="panelDrag"></div>
   <div id="panelMain">
     <header class="ptabs">
       <button class="ptab active" data-ptab="start">
@@ -828,7 +856,7 @@
       </div>
     </div>
     <div class="pview" id="viewFiles" hidden>
-      <div id="crumbs"><button id="refreshBtn" title="刷新"></button></div>
+      <div id="crumbs"><button id="openDirBtn" title="在系统文件管理器中打开"></button><button id="refreshBtn" title="刷新"></button></div>
       <div id="fileList"></div>
       <div id="filePreview" hidden>
         <div class="pv-head">
@@ -875,10 +903,10 @@
     <input id="wsNameInput" placeholder="如：我的项目（留空则用目录名）" autocomplete="off" />
     <label for="wsPathInput">目录路径</label>
     <div class="path-row">
-      <input id="wsPathInput" placeholder="如 /home/me/mino/my_project（不存在会自动创建）" autocomplete="off" />
+      <input id="wsPathInput" placeholder="如 /home/me/kuriboh/my_project（不存在会自动创建）" autocomplete="off" />
       <button id="wsBrowse" type="button">浏览…</button>
     </div>
-    <div class="hint">相对路径按用户主目录解析，如 mino/my_project；也可点「浏览」用系统选择器选取</div>
+    <div class="hint">相对路径按用户主目录解析，如 kuriboh/my_project；也可点「浏览」用系统选择器选取</div>
     <div class="err" id="wsErr"></div>
     <div class="actions">
       <button id="wsCancel">取消</button>
@@ -926,7 +954,7 @@
         stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
     </button>
     <h2>设置</h2>
-    <div class="sub">模型 / 代理 / 搜索 / 通用保存在本机 ~/.config/Mino/，仅本进程使用</div>
+    <div class="sub">模型 / 代理 / 搜索 / 通用保存在本机 ~/.config/Kuriboh/，仅本进程使用</div>
     <div class="settings-body">
       <nav class="settings-nav">
         <button class="snav active" data-tab="model">模型</button>
@@ -1025,41 +1053,13 @@
     </div>
     <div class="tab-panel" data-panel="about" hidden>
       <div class="about-head">
-        <svg class="about-logo" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <defs>
-            <linearGradient id="aboutLogoBg" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stop-color="#303036" />
-              <stop offset="1" stop-color="#141417" />
-            </linearGradient>
-            <linearGradient id="aboutLogoGlow" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stop-color="#ffffff" stop-opacity="0.10" />
-              <stop offset="1" stop-color="#ffffff" stop-opacity="0" />
-            </linearGradient>
-            <clipPath id="aboutLogoBody">
-              <rect x="84" y="84" width="856" height="856" rx="190" />
-            </clipPath>
-          </defs>
-          <rect x="84" y="84" width="856" height="856" rx="190" fill="url(#aboutLogoBg)" />
-          <g clip-path="url(#aboutLogoBody)">
-            <ellipse cx="512" cy="120" rx="760" ry="440" fill="url(#aboutLogoGlow)" />
-          </g>
-          <g fill="none" stroke="#F6F2E9" stroke-width="96">
-            <path d="M290 541 A111 111 0 0 1 512 541" />
-            <path d="M512 541 A111 111 0 0 1 734 541" />
-          </g>
-          <g fill="#F6F2E9">
-            <path d="M242 541 V682 a48 48 0 0 0 96 0 V541 Z" />
-            <path d="M464 541 V682 a48 48 0 0 0 96 0 V541 Z" />
-            <path d="M686 541 V682 a48 48 0 0 0 96 0 V541 Z" />
-          </g>
-          <circle cx="512" cy="296" r="48" fill="#E8573F" />
-        </svg>
+        <img class="about-logo" src="logo.png" alt="logo" aria-hidden="true">
         <div>
-          <div class="about-name">Mino</div>
+          <div class="about-name">Kuriboh</div>
           <p class="about-desc">一个在本机运行的桌面 AI Agent，界面、模型与对话数据都留在你自己的电脑上。</p>
         </div>
       </div>
-      <a class="about-link" id="aboutRepoLink" href="https://github.com/OneStackCoder/Muji">https://github.com/OneStackCoder/Muji</a>
+      <a class="about-link" id="aboutRepoLink" href="https://github.com/OneStackCoder/Kuriboh">Github</a>
     </div>
       </div>
     </div>
@@ -1115,7 +1115,7 @@
     <div class="sub">付费网页搜索，国内可直连；失败时自动回落模型商搜索</div>
     <label for="bochaApiKey">API Key</label>
     <input id="bochaApiKey" type="password" placeholder="在 open.bochaai.com 申请" autocomplete="off" />
-    <div class="hint">仅保存在本机 ~/.config/Mino/，不会上传</div>
+    <div class="hint">仅保存在本机 ~/.config/Kuriboh/，不会上传</div>
     <div class="actions">
       <button id="bochaConfigDone" class="primary">完成</button>
     </div>
@@ -1129,7 +1129,7 @@
     <label for="serpapiApiKey">API Key</label>
     <input id="serpapiApiKey" type="password" placeholder="在 serpapi.com 申请" autocomplete="off" />
     <div class="hint">会依次使用 Google 和 Brave 两个引擎：优先 Google，搜不到自动换 Brave</div>
-    <div class="hint">仅保存在本机 ~/.config/Mino/，不会上传</div>
+    <div class="hint">仅保存在本机 ~/.config/Kuriboh/，不会上传</div>
     <div class="actions">
       <button id="serpapiConfigDone" class="primary">完成</button>
     </div>
@@ -1148,7 +1148,13 @@
   const input = document.getElementById('input');
   const sendBtn = document.getElementById('send');
   const sessionsBox = document.getElementById('sessions');
-  let busy = false;
+  // 会话运行缓冲：sid → { events, finished, body }。会话切走后事件继续按 threadId
+  // 缓冲，切回时截断 checkpoint 尾部重复轮次后重放；finished 记 done/stopped/error
+  const running = new Map();
+  const isRunning = (id) => {
+    const e = id && running.get(id);
+    return !!e && !e.finished;
+  };
   let currentSessionId = null; // 当前会话 id（新会话发送首条消息前为 null）
   let sessionQuery = ''; // 会话搜索关键字（前端按标题过滤）
   let editingId = null; // 正在行内重命名的会话 id（refreshSessions 保留渲染编辑框）
@@ -1160,10 +1166,10 @@
   marked.use(window.markedKatex({ throwOnError: false, nonStandard: true }));
 
   // 原生 RPC 在页面加载完成后才注入，轮询等待就绪
-  const waitMinoAgent = () => new Promise((resolve) => {
-    if (window.MinoAgent) return resolve();
+  const waitKuribohAgent = () => new Promise((resolve) => {
+    if (window.KuribohAgent) return resolve();
     const timer = setInterval(() => {
-      if (window.MinoAgent) { clearInterval(timer); resolve(); }
+      if (window.KuribohAgent) { clearInterval(timer); resolve(); }
     }, 50);
   });
 
@@ -1243,7 +1249,7 @@
   const PERM_DESCS = {
     readonly: '读取任意文件无需确认；任何写入操作都需要你逐一确认',
     workspace: '读取不受限，工作区内自由读写；工作区外的写入需要你确认',
-    full: '任意位置的读写都无需确认，启用时需确认风险',
+    full: '任意读写与系统命令都无需确认，启用时需确认风险',
   };
   let currentPermission = 'workspace';
 
@@ -1310,9 +1316,9 @@
   }
 
   async function activateSavedModel(id) {
-    if (busy || id === modelsState.activeId) return;
+    if (isRunning(currentSessionId) || id === modelsState.activeId) return;
     try {
-      applyModels(await window.MinoAgent.setActiveModel(id));
+      applyModels(await window.KuribohAgent.setActiveModel(id));
       await resetChatForNewSession();
       const m = activeModel();
       showWsMsg('已切换模型：' + (m ? m.model : '') + '（已开启新会话）');
@@ -1326,7 +1332,7 @@
     btn.classList.add('testing'); // 测试期间图标旋转
     btn.title = '测试中…';
     try {
-      await window.MinoAgent.testModel(m.id);
+      await window.KuribohAgent.testModel(m.id);
       showWsMsg('连接成功：' + m.model);
     } catch (err) {
       showWsMsg('连接失败：' + err.message);
@@ -1566,7 +1572,7 @@
     selectedFontSize = px;
     applyFontSize(px);
     // 立即持久化：后端对漏传字段沿用现值，但 proxy/theme 属整体覆盖，需显式带上
-    window.MinoAgent
+    window.KuribohAgent
       ?.setSettings({ theme: activeSettings.theme, proxy: activeSettings.proxy, fontSize: px })
       .catch(() => {});
   });
@@ -1659,8 +1665,8 @@
     return new Promise((resolve) => {
       permConfirmTitle.textContent = '风险提示：完全权限';
       permConfirmMsg.textContent =
-        '完全权限意味着 Agent 可以无需确认地写入工作区以外的任意文件（包括系统配置、密钥、个人数据等敏感位置）。' +
-        '模型输出若有错误或被恶意内容诱导，可能造成数据泄露或文件破坏。确定要启用吗？';
+        '完全权限意味着 Agent 可以无需确认地写入工作区以外的任意文件（包括系统配置、密钥、个人数据等敏感位置），并直接执行系统命令与进程操作。' +
+        '模型输出若有错误或被恶意内容诱导，可能造成数据泄露、文件破坏或更严重的系统影响。确定要启用吗？';
       permConfirmOk.textContent = '我已了解风险，启用';
       const close = (result) => {
         permConfirmOverlay.hidden = true;
@@ -1696,14 +1702,14 @@
   }
   async function choosePerm(level) {
     hidePermMenu();
-    if (busy || level === currentPermission) return;
+    if (isRunning(currentSessionId) || level === currentPermission) return;
     // 切换到「完全权限」需确认风险；取消则保持原权限
     if (level === 'full') {
       const ok = await askPermConfirm();
       if (!ok) return;
     }
     try {
-      const r = await window.MinoAgent.setPermission(level);
+      const r = await window.KuribohAgent.setPermission(level);
       currentPermission = r.permission;
       renderPermBtn();
     } catch (err) {
@@ -1712,7 +1718,7 @@
   }
   permBtn.onclick = (e) => {
     e.stopPropagation();
-    if (busy) return;
+    if (isRunning(currentSessionId)) return;
     if (permMenu.style.display === 'block') { hidePermMenu(); return; }
     renderPermMenu();
     hideWsMenu();
@@ -1731,7 +1737,7 @@
     const engineOrder = Array.from(searchPanel.querySelectorAll('.engine-card'))
       .map((c) => (c.id === 'bochaCard' ? 'bocha' : 'serpapi'));
     try {
-      const s = await window.MinoAgent.setSettings({
+      const s = await window.KuribohAgent.setSettings({
         proxy: {
           protocol: proxyProtocol.value,
           host: proxyHost.value.trim(),
@@ -1788,8 +1794,8 @@
     const editedActive = !!editingModelId && editingModelId === prevActiveId;
     try {
       const state = editingModelId
-        ? await window.MinoAgent.updateModel({ id: editingModelId, ...payload })
-        : await window.MinoAgent.addModel(payload);
+        ? await window.KuribohAgent.updateModel({ id: editingModelId, ...payload })
+        : await window.KuribohAgent.addModel(payload);
       applyModels(state);
       // 改的是当前模型（或首次新增自动启用）时，原生侧已开启新会话
       if (editedActive || modelsState.activeId !== prevActiveId) await resetChatForNewSession();
@@ -1813,7 +1819,7 @@
     if (!m) return;
     const wasActive = m.id === modelsState.activeId;
     try {
-      applyModels(await window.MinoAgent.deleteModel(m.id));
+      applyModels(await window.KuribohAgent.deleteModel(m.id));
       if (wasActive) await resetChatForNewSession();
     } catch (err) {
       settingsErr.textContent = err.message;
@@ -1839,7 +1845,7 @@
     testConnBtn.disabled = true;
     testConnBtn.textContent = '测试中…';
     try {
-      await window.MinoAgent.testConnection({
+      await window.KuribohAgent.testConnection({
         id: editingModelId || '',
         provider: provSel.value,
         model,
@@ -1861,7 +1867,7 @@
     modelInput.hidden = !manual;
     if (manual) modelInput.focus();
   };
-  document.getElementById('settings').onclick = () => { if (!busy) openSettings(); };
+  document.getElementById('settings').onclick = () => openSettings();
   document.getElementById('settingsCancel').onclick = () => {
     overlay.hidden = true;
     bochaConfigOverlay.hidden = true;
@@ -1879,7 +1885,7 @@
   const aboutRepoLink = document.getElementById('aboutRepoLink');
   aboutRepoLink.onclick = (e) => {
     e.preventDefault();
-    window.MinoAgent.openExternal(aboutRepoLink.href).catch(() => {});
+    window.KuribohAgent.openExternal(aboutRepoLink.href).catch(() => {});
   };
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) { overlay.hidden = true; applyTheme(activeSettings.theme); }
@@ -1954,10 +1960,10 @@
       item.append(check, body);
       item.onclick = async () => {
         hideWsMenu();
-        if (busy || isActive) return;
+        if (isRunning(currentSessionId) || isActive) return;
         if (locked) { showWsMsg('已有对话历史，不能切换工作区（可先点「新对话」）'); return; }
         try {
-          wsState = await window.MinoAgent.setWorkspace(w.id);
+          wsState = await window.KuribohAgent.setWorkspace(w.id);
           refreshToolPanel(); // 面板回到新工作区根目录
         } catch (err) {
           showWsMsg(err.message);
@@ -1976,7 +1982,7 @@
   }
 
   async function refreshWorkspaces() {
-    wsState = await window.MinoAgent.getWorkspaces();
+    wsState = await window.KuribohAgent.getWorkspaces();
     renderWorkspaces();
   }
 
@@ -2013,7 +2019,7 @@
   document.getElementById('wsCancel').onclick = () => { wsOverlay.hidden = true; };
   document.getElementById('wsBrowse').onclick = async () => {
     try {
-      const dir = await window.MinoAgent.pickDirectory();
+      const dir = await window.KuribohAgent.pickDirectory();
       if (dir) wsPathInput.value = dir;
     } catch (err) {
       wsErr.textContent = err.message;
@@ -2022,7 +2028,7 @@
   async function saveWorkspace() {
     wsErr.textContent = '';
     try {
-      wsState = await window.MinoAgent.addWorkspace({
+      wsState = await window.KuribohAgent.addWorkspace({
         name: wsNameInput.value,
         path: wsPathInput.value,
       });
@@ -2060,7 +2066,7 @@
       `删除工作区「${w.name}」（${w.path}）？仅从列表移除，不会删除磁盘上的目录。`,
       async () => {
         try {
-          wsState = await window.MinoAgent.deleteWorkspace(wsState.activeId);
+          wsState = await window.KuribohAgent.deleteWorkspace(wsState.activeId);
           refreshToolPanel(); // 面板切到删除后生效的工作区
           renderWorkspaces();
         } catch (err) {
@@ -2090,13 +2096,19 @@
     const id = pendingDeleteSessionId;
     pendingDeleteSessionId = null;
     if (!id) return;
-    const r = await window.MinoAgent.deleteSession(id);
+    const r = await window.KuribohAgent.deleteSession(id);
+    running.delete(id); // 运行缓冲随会话一并丢弃（后端已先定向停止该轮）
     if (r && r.cleared) {
       // 删除的是当前会话：原生侧已开启新会话，界面清空；权限回到默认值
       list.innerHTML = '';
       currentSessionId = null;
       currentPermission = 'workspace';
       renderPermBtn();
+      // 删除的可能是流式中的当前会话：视图回到新会话，恢复发送态与三项解锁
+      setStopMode(false);
+      wsBtn.disabled = false;
+      modelBtn.disabled = false;
+      permBtn.disabled = false;
       renderWorkspaces(); // 回到新会话 → 解锁工作区切换
       input.focus();
     }
@@ -2219,7 +2231,7 @@
     return btn;
   }
   async function copyText(text) {
-    // mino:// 自定义协议下通常不是 secure context，clipboard API 可能不可用，兜底 execCommand
+    // kuriboh:// 自定义协议下通常不是 secure context，clipboard API 可能不可用，兜底 execCommand
     if (navigator.clipboard && window.isSecureContext) {
       try { await navigator.clipboard.writeText(text); return; } catch {}
     }
@@ -2238,9 +2250,6 @@
       .replace(/\\\(([\s\S]+?)\\\)/g, (_m, f) => '$' + f + '$');
     return DOMPurify.sanitize(marked.parse(conv));
   }
-  // 当前流式回答的容器与累计文本（answer_start 新开一段，answer_delta 追加）
-  let streamMd = null;
-  let streamText = '';
   // ---------- 思考过程面板 ----------
   // pending: 发送后的「正在思考…」占位（模型没有思维链时随首个事件直接撤掉）
   // thinking: reasoning 流式中，灰色斜体增量实时展示
@@ -2320,8 +2329,13 @@
     body.appendChild(wrap);
     const block = {
       name,
+      argsJson: JSON.stringify(args ?? null),
       setEngine(tag) {
         head.insertBefore(el('span', 'tool-engine', tag), summary);
+      },
+      markApproved() {
+        if (head.querySelector('.tool-approved')) return;
+        head.insertBefore(el('span', 'tool-approved', '✓ 已批准'), summary);
       },
       finish(text, ok = true) {
         wrap.classList.remove('running');
@@ -2390,11 +2404,26 @@
       const bar = el('div', 'confirm-bar');
       const submit = () => {
         bar.remove();
-        window.MinoAgent
+        window.KuribohAgent
           .resolveConfirm({
+            threadId: ev.threadId, // 多会话并发时可能有多个挂起的确认，按会话定向回传
             decisions: decisions.map((d) => d || { type: 'reject', message: '用户拒绝执行该操作' }),
           })
           .catch((err) => card.appendChild(el('div', 'error', '提交确认失败: ' + err.message)));
+      };
+      // 已批准的 run_command：给对应工具块挂「已批准」徽标；按名称+参数 JSON 配对
+      //（确认卡只列被拦截的调用，同轮被放行的只读调用不占行，按出现序会标错块）
+      const markApprovedRun = (i) => {
+        const call = calls[i];
+        const argsJson = JSON.stringify(call.args ?? null);
+        // 同名同参的多次调用按出现序依次配对
+        const nth = calls.slice(0, i).filter((c) => c && c.name === call.name && JSON.stringify(c.args ?? null) === argsJson).length;
+        let seen = 0;
+        for (const t of body._pendingTools || []) {
+          if (t.name !== call.name || t.argsJson !== argsJson) continue;
+          if (seen === nth) { if (t.markApproved) t.markApproved(); return; }
+          seen++;
+        }
       };
       const decide = (i, ok) => {
         if (decisions[i]) return; // 该行已决策，锁定
@@ -2403,6 +2432,7 @@
         marks[i].textContent = ok ? '已允许' : '已拒绝';
         marks[i].className = 'confirm-mark ' + (ok ? 'ok' : 'no');
         btns[i].remove();
+        if (ok && calls[i].name === 'run_command') markApprovedRun(i);
         if (decisions.every(Boolean)) submit();
       };
       calls.forEach((call, i) => {
@@ -2435,27 +2465,31 @@
       card.appendChild(bar);
       body.appendChild(card);
     } else if (ev.type === 'answer_start') {
-      streamMd = el('div', 'md');
-      streamText = '';
-      body.appendChild(streamMd);
+      // 流式容器挂在 body 上而非模块级变量：多会话并发流式时互不串台
+      body._streamMd = el('div', 'md');
+      body._streamText = '';
+      body.appendChild(body._streamMd);
       // 复制用：本轮回答开一个新段落槽（工具调用后会再次 answer_start 换段）
       ((body.parentNode._rawParts ??= [])).push('');
     } else if (ev.type === 'answer_delta') {
-      if (!streamMd) {
-        streamMd = el('div', 'md');
-        streamText = '';
-        body.appendChild(streamMd);
+      if (!body._streamMd) {
+        body._streamMd = el('div', 'md');
+        body._streamText = '';
+        body.appendChild(body._streamMd);
         ((body.parentNode._rawParts ??= [])).push('');
       }
-      streamText += ev.text;
+      body._streamText += ev.text;
       // 整段重渲染：文本量小，成本可忽略，且能保证 Markdown/公式实时正确
-      streamMd.innerHTML = renderMd(streamText);
+      body._streamMd.innerHTML = renderMd(body._streamText);
       // 同步记录段落原文，hover 复制时取的就是 Markdown 源文本
       const parts = body.parentNode._rawParts;
-      if (parts) parts[parts.length - 1] = streamText;
+      if (parts) parts[parts.length - 1] = body._streamText;
     } else if (ev.type === 'error') {
       settlePendingTools(body, false); // 流中断：未完成的调用停止脉冲动画
       body.appendChild(el('div', 'error', '出错了: ' + ev.message));
+    } else if (ev.type === 'stopped') {
+      settlePendingTools(body, false); // 中止：未完成的调用停止脉冲动画
+      body.appendChild(el('div', 'stopped-tag', '已停止'));
     } else if (ev.type === 'done') {
       if (!body.querySelector('.md') && !body.querySelector('.error')) {
         body.appendChild(el('div', 'md', '(无回复)'));
@@ -2463,6 +2497,22 @@
     }
     scrollDown();
   }
+
+  // ---------- 事件路由：会话进行时可切走，事件按 threadId 分流 ----------
+  // 全局单例绑定（不再每轮覆盖）：当前会话的事件实时渲染进 entry.body，
+  // 其他会话只进缓冲，切回时由 renderHistory 截断 checkpoint 尾部重复轮后重放补上
+  function routeEvent(ev) {
+    if (!ev.threadId) return; // config 等全局事件，前端不消费
+    const entry = running.get(ev.threadId);
+    if (!entry) return; // 会话已删除等无缓冲场景，直接丢弃
+    entry.events.push(ev);
+    if (ev.type === 'done' || ev.type === 'stopped' || ev.type === 'error') {
+      entry.finished = ev.type;
+      if (ev.threadId !== currentSessionId) refreshSessions(); // 后台轮结束：刷新侧栏活跃时间
+    }
+    if (ev.threadId === currentSessionId) handleEvent(ev, entry.body);
+  }
+  window.onKuribohAgentEvent = routeEvent;
 
   // ---------- 历史会话侧栏 ----------
   function fmtTime(ts) {
@@ -2479,7 +2529,7 @@
   }
 
   async function refreshSessions() {
-    const sessList = await window.MinoAgent.listSessions();
+    const sessList = await window.KuribohAgent.listSessions();
     // 搜索框按标题过滤（大小写不敏感）
     const q = sessionQuery;
     const shown = q ? sessList.filter((s) => (s.title || '').toLowerCase().includes(q)) : sessList;
@@ -2520,7 +2570,7 @@
       del.title = '删除会话';
       del.onclick = (e) => {
         e.stopPropagation();
-        if (busy) return;
+        // 运行中的会话也允许删除：后端会先定向停止该轮再删
         pendingDeleteSessionId = s.id;
         sessionConfirmMsg.textContent =
           `删除会话「${s.title || '新对话'}」？该会话的对话记录将被永久删除，无法恢复。`;
@@ -2529,13 +2579,20 @@
       item.appendChild(meta);
       item.appendChild(del);
       item.onclick = async () => {
-        if (busy || s.id === currentSessionId) return;
-        const detail = await window.MinoAgent.openSession(s.id);
+        if (s.id === currentSessionId) return;
+        const detail = await window.KuribohAgent.openSession(s.id);
         currentSessionId = detail.id;
         currentPermission = detail.permission; // 恢复该会话的权限设置
         renderPermBtn();
-        renderHistory(detail.items);
+        // 目标会话有运行缓冲（后台流 / 停止轮半截内容）时先截断再重放，无缝衔接
+        renderHistory(detail.items, running.get(s.id));
         renderWorkspaces(); // 选中已有会话 → 锁定工作区切换
+        // 切回的会话若流式进行中：恢复停止按钮与三项锁定（后台会话不影响本视图）
+        const run = isRunning(currentSessionId);
+        setStopMode(run);
+        wsBtn.disabled = run;
+        modelBtn.disabled = run;
+        permBtn.disabled = run;
         await refreshSessions();
         input.focus();
       };
@@ -2562,7 +2619,7 @@
     editingId = null;
     const val = inp.value.trim();
     if (save && val && val !== s.title) {
-      await window.MinoAgent.renameSession({ id: s.id, title: val });
+      await window.KuribohAgent.renameSession({ id: s.id, title: val });
     }
     await refreshSessions();
   }
@@ -2592,14 +2649,15 @@
   // 只重新拉取配置、会话列表和当前会话的消息历史
   document.getElementById('ctxReload').onclick = async () => {
     hideCtxMenu();
-    if (busy) return;
-    applyModels(await window.MinoAgent.getModels());
+    // 正在流式的会话不软刷新：半截 checkpoint 会冲掉缓冲补全的实时视图
+    if (isRunning(currentSessionId)) return;
+    applyModels(await window.KuribohAgent.getModels());
     await refreshWorkspaces();
     if (currentSessionId) {
-      const detail = await window.MinoAgent.openSession(currentSessionId);
+      const detail = await window.KuribohAgent.openSession(currentSessionId);
       currentPermission = detail.permission;
       renderPermBtn();
-      renderHistory(detail.items);
+      renderHistory(detail.items, running.get(currentSessionId));
     } else {
       list.innerHTML = '';
     }
@@ -2625,8 +2683,25 @@
     refreshSessions();
   });
 
-  // 把后端返回的历史条目渲染成消息流（assistant 轮复用流式事件渲染逻辑）
-  function renderHistory(items) {
+  // 把后端返回的历史条目渲染成消息流（assistant 轮复用流式事件渲染逻辑）。
+  // entry 为该会话的运行缓冲（后台流 / 停止、出错轮的半截内容）：缓冲覆盖的轮次
+  // 在 checkpoint 里只可能有完整或半截版本，从缓冲首条 user 消息处截断 checkpoint
+  // 再整体重放，避免重复或丢内容
+  function renderHistory(items, entry) {
+    if (entry) {
+      const uts = entry.events.filter((e) => e.type === 'user').map((e) => e.text);
+      let k = uts.length, cut = -1;
+      for (let i = items.length - 1; i >= 0 && k > 0; i--) {
+        if (items[i].role !== 'user') continue;
+        // 从尾向前按文本对齐缓冲轮的 user 消息；对不上的说明该轮 user 消息
+        // 还没写进 checkpoint（superstep 未完成），跳过继续找更早的
+        while (k > 0 && items[i].text !== uts[k - 1]) k--;
+        if (k === 0) break; // 再对不上的是缓冲之前的早期轮次，checkpoint 内容保留
+        cut = i;
+        k--;
+      }
+      if (cut >= 0) items = items.slice(0, cut);
+    }
     list.innerHTML = '';
     for (const it of items) {
       if (it.role === 'user') {
@@ -2644,61 +2719,122 @@
         settlePendingTools(body, true); // 兜底：历史缺结果消息时也收尾工具块
       }
     }
+    if (entry) {
+      // 从缓冲重放：user 伪事件开新气泡，流事件走与实时渲染同一管线（幂等）
+      let body = null;
+      for (const ev of entry.events) {
+        if (ev.type === 'user') {
+          addMsg('user', ev.text).appendChild(el('div', 'md', ev.text));
+          body = addMsg('ai');
+          createThinkPanel(body); // 与 send 一致：先放「正在思考…」占位
+        } else if (body) {
+          handleEvent(ev, body);
+        }
+      }
+      entry.body = body || addMsg('ai'); // 后续事件继续流入最后一个气泡
+    }
     scrollDown();
   }
 
   document.getElementById('newChat').onclick = async () => {
-    if (busy) return;
-    await window.MinoAgent.newSession();
+    await window.KuribohAgent.newSession();
     currentSessionId = null;
     currentPermission = 'workspace'; // 新会话回到默认权限
     renderPermBtn();
     list.innerHTML = '';
+    // 上一视图可能停在流式中的停止按钮/锁定态；新会话视图必然空闲，恢复发送态
+    setStopMode(false);
+    wsBtn.disabled = false;
+    modelBtn.disabled = false;
+    permBtn.disabled = false;
     renderWorkspaces(); // 新会话 → 解锁工作区切换
     await refreshSessions();
     input.focus();
   };
 
+  // 会话进行中发送按钮切换为停止按钮（红色描边方块）
+  function setStopMode(on) {
+    sendBtn.classList.toggle('stop', on);
+    sendBtn.title = on ? '停止' : '发送';
+    sendBtn.innerHTML = on
+      ? '<svg viewBox="0 0 24 24" width="18" height="18"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>'
+      : '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>';
+    // 停止态须保持可点；回到发送态时输入为空则置灰
+    sendBtn.disabled = on ? false : !input.value.trim();
+  }
+
   async function send() {
     const text = input.value.trim();
-    if (!text || busy) return;
-    busy = true;
-    sendBtn.disabled = true;
+    if (!text) return;
+    // 新会话 id 由前端生成：chat 在轮次结束才返回，期间事件已按该 id 路由/缓冲
+    const isNew = currentSessionId === null;
+    const sid = isNew ? crypto.randomUUID() : currentSessionId;
+    if (isRunning(sid)) return;
     hideWsMenu();
     hideModelMenu();
     hidePermMenu();
-    wsBtn.disabled = true; // 流式期间锁定工作区（切换需重建 agent）
+    if (isNew) {
+      currentSessionId = sid;
+      renderWorkspaces(); // 新会话即有归属 → 锁定工作区切换
+    }
+    setStopMode(true);
+    wsBtn.disabled = true; // 本轮流式期间锁定（仅当前会话，后台会话不影响其他视图）
     modelBtn.disabled = true; // 流式期间锁定模型切换
     permBtn.disabled = true; // 流式期间锁定权限切换（拦截规则构建时固化）
     input.value = '';
     addMsg('user', text).appendChild(el('div', 'md', text));
     const body = addMsg('ai');
     createThinkPanel(body); // 占位「正在思考…」；reasoning 到达后转为思考面板
+    // 上一轮停止/出错的半截内容只存在于本缓冲：并入本轮，切回时才能完整重放；
+    // done 轮 checkpoint 已完整落盘，旧缓冲直接丢弃
+    const old = running.get(sid);
+    const events = old && old.finished !== 'done' ? old.events.slice() : [];
+    events.push({ type: 'user', text });
+    const entry = { events, finished: null, body };
+    running.set(sid, entry);
     try {
-      // 流式事件经 window.onMinoAgentEvent 回调推送，chat 结束即本轮完成
-      window.onMinoAgentEvent = (ev) => handleEvent(ev, body);
-      const r = await window.MinoAgent.chat(text);
-      currentSessionId = r ? r.sessionId : currentSessionId;
+      // 事件经全局 routeEvent 按 threadId 分流：当前会话实时渲染进 entry.body
+      await window.KuribohAgent.chat(text, sid);
     } catch (err) {
       body._think?.finish(); // 未收到任何事件：撤掉占位或折叠思考面板
       settlePendingTools(body, false); // 请求失败：未完成的工具块停止脉冲动画
       body.appendChild(el('div', 'error', '请求失败: ' + err.message));
+      entry.finished = 'error';
+      if (isNew && entry.events.length <= 1) {
+        // 一个流事件都没到：后端未建立会话（如未配置模型），回滚新会话状态
+        running.delete(sid);
+        currentSessionId = null;
+        renderWorkspaces();
+      }
     }
-    busy = false;
-    sendBtn.disabled = false;
-    wsBtn.disabled = false;
-    modelBtn.disabled = false;
-    permBtn.disabled = false;
-    input.focus();
-    scrollDown();
+    // 用户可能已切走（currentSessionId 变了）：只在还看着本会话时恢复视图，
+    // 切走的会话由切换逻辑自行设置状态，后台轮结束后台静默收场
+    const stillHere = currentSessionId === sid;
+    if (stillHere) {
+      setStopMode(false);
+      wsBtn.disabled = false;
+      modelBtn.disabled = false;
+      permBtn.disabled = false;
+      input.focus();
+      scrollDown();
+      renderWorkspaces();
+    }
     await refreshSessions(); // 新会话落盘后出现在侧栏
-    renderWorkspaces(); // 首条消息后 currentSessionId 已产生 → 锁定工作区
   }
 
-  sendBtn.onclick = send;
+  // 会话进行中点击即停止当前轮（chat 返回后 send 的收尾逻辑恢复按钮）
+  sendBtn.onclick = () => {
+    if (isRunning(currentSessionId)) window.KuribohAgent.stopChat(currentSessionId).catch(() => {});
+    else send();
+  };
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
+  // 输入为空时发送按钮置灰；停止态不受影响（须可点停止）
+  input.addEventListener('input', () => {
+    if (!sendBtn.classList.contains('stop')) sendBtn.disabled = !input.value.trim();
+  });
+  sendBtn.disabled = true; // 初始输入框为空
 
   // ---------- 工具面板（页面内右侧栏）：开始页 / 工作区文件 / 多终端 ----------
   const toolPanel = document.getElementById('toolPanel');
@@ -2720,6 +2856,7 @@
   const pvBody = document.getElementById('pvBody');
   const pvBack = document.getElementById('pvBack');
   const refreshBtn = document.getElementById('refreshBtn');
+  const openDirBtn = document.getElementById('openDirBtn');
 
   const ICON_FOLDER = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.6 3.9A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>';
   const ICON_FILE = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>';
@@ -2740,6 +2877,13 @@
   const clampPanelW = (w) =>
     Math.floor(Math.min(Math.max(w, 280), Math.max(280, window.innerWidth - 608)));
   function applyPanelW() { toolPanel.style.width = panelW + 'px'; }
+
+  // 左侧会话栏宽度（px）：CSS 默认 248；下限 200，上限 480，拖拽结束后持久化
+  const sidebar = document.getElementById('sidebar');
+  const sideDrag = document.getElementById('sideDrag');
+  let sideW = 248;
+  const clampSideW = (w) => Math.floor(Math.min(Math.max(w, 200), 480));
+  const applySideW = () => { sidebar.style.width = sideW + 'px'; };
 
   function setPanelOpen(open) {
     panelOpen = open;
@@ -2766,12 +2910,10 @@
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
       document.body.classList.remove('panel-resizing');
-      panelDrag.classList.remove('on');
-      try { window.MinoAgent.setPanelWidth(panelW); } catch { /* 持久化失败不影响使用 */ }
+      try { window.KuribohAgent.setPanelWidth(panelW); } catch { /* 持久化失败不影响使用 */ }
       resizeTerm(); // bash 收到 SIGWINCH，换行宽度立即生效
     };
     document.body.classList.add('panel-resizing');
-    panelDrag.classList.add('on');
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
   });
@@ -2783,6 +2925,63 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(resizeTerm, 150);
   });
+
+  // ---------- 左侧会话栏分隔条拖拽：栏贴左侧，鼠标右移 = 加宽 ----------
+  sideDrag.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sideW;
+    const move = (ev) => {
+      sideW = clampSideW(startW + (ev.clientX - startX));
+      applySideW();
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.classList.remove('panel-resizing');
+      try { window.KuribohAgent.setSidebarWidth(sideW); } catch { /* 持久化失败不影响使用 */ }
+    };
+    document.body.classList.add('panel-resizing');
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+
+  // ---------- 聊天区内容宽度（消息 + 输入框共享 max-width）：左右拉伸条 ----------
+  const chatDragL = document.getElementById('chatDragL');
+  const chatDragR = document.getElementById('chatDragR');
+  let chatW = 860;
+  const clampChatW = (w) => Math.floor(Math.min(Math.max(w, 450), 1600));
+  const chatMain = document.getElementById('main');
+  const applyChatW = () => {
+    document.documentElement.style.setProperty('--chat-max', chatW + 'px');
+  };
+  const dragChat = (bar, dir) => {
+    bar.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = chatW;
+      // 上限同时受聊天区实际宽度约束：拖到内容填满即顶住，条始终可抓、反拖随时见效
+      const maxW = Math.min(1600, chatMain.clientWidth);
+      const move = (ev) => {
+        // 左条向左拖、右条向右拖 = 加宽，两条方向相反
+        chatW = Math.floor(Math.min(Math.max(startW + dir * (ev.clientX - startX), 450), maxW));
+        applyChatW();
+      };
+      const up = () => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        document.body.classList.remove('panel-resizing');
+        try { window.KuribohAgent.setChatWidth(chatW); } catch { /* 持久化失败不影响使用 */ }
+      };
+      document.body.classList.add('panel-resizing');
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+  };
+  dragChat(chatDragL, -1);
+  dragChat(chatDragR, 1);
 
   // ---------- 页签：开始页 / 工作区文件唯一 / 终端可多开 ----------
   const startBtn = document.querySelector('.ptab[data-ptab="start"]');
@@ -2822,6 +3021,7 @@
         crumbs.appendChild(crumb);
       });
     }
+    crumbs.appendChild(openDirBtn);
     crumbs.appendChild(refreshBtn);
   }
 
@@ -2853,7 +3053,7 @@
 
   async function loadDir(rel) {
     try {
-      const r = await window.MinoAgent.listDir(rel);
+      const r = await window.KuribohAgent.listDir(rel);
       curRel = r.rel;
       previewRel = null;
       filePreview.hidden = true;
@@ -2873,7 +3073,7 @@
 
   async function openPreview(rel) {
     try {
-      const f = await window.MinoAgent.readFile(rel);
+      const f = await window.KuribohAgent.readFile(rel);
       previewRel = rel;
       fileList.hidden = true;
       filePreview.hidden = false;
@@ -2890,7 +3090,12 @@
   }
 
   pvBack.onclick = closePreview;
-  // 刷新图标（环形箭头）
+  // 打开图标（外部链接）：在系统文件管理器中打开当前目录；刷新图标（环形箭头）
+  openDirBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
+  openDirBtn.onclick = async () => {
+    try { await window.KuribohAgent.openDir(curRel); }
+    catch (err) { showWsMsg(err.message || String(err)); }
+  };
   refreshBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></svg>';
   refreshBtn.onclick = () => {
     if (previewRel) openPreview(previewRel);
@@ -2944,7 +3149,46 @@
     const t = activeTerm();
     if (!t || !t.term) return;
     fitTerm();
-    window.MinoAgent.termResize({ id: t.id, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+    window.KuribohAgent.termResize({ id: t.id, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+  }
+
+  // ---------- 面板字号：文件页 / 终端 Ctrl+滚轮缩放，持久化到 settings ----------
+  let filesFs = 13;
+  let termFs = 13;
+  const applyFilesFs = () => { toolPanel.style.setProperty('--files-fs', filesFs + 'px'); };
+  const applyTermFs = () => {
+    // 所有已开终端一起改；非激活终端 holder 尺寸为 0，等激活时 ResizeObserver 再算行列
+    for (const t of terminals.values()) {
+      if (t.term) t.term.options.fontSize = termFs;
+    }
+    resizeTerm();
+  };
+  // 滚轮是连续事件，防抖 400ms 再写盘（theme/proxy 属整体覆盖字段，保存时需显式带上）
+  let fsSaveTimer = 0;
+  const saveFsLater = () => {
+    clearTimeout(fsSaveTimer);
+    fsSaveTimer = setTimeout(() => {
+      window.KuribohAgent
+        ?.setSettings({ theme: activeSettings.theme, proxy: activeSettings.proxy, filesFontSize: filesFs, termFontSize: termFs })
+        .catch(() => {});
+    }, 400);
+  };
+  const zoomFs = (which, delta) => {
+    const cur = which === 'files' ? filesFs : termFs;
+    const next = Math.min(24, Math.max(8, cur + delta));
+    if (next === cur) return;
+    if (which === 'files') { filesFs = next; applyFilesFs(); }
+    else { termFs = next; applyTermFs(); }
+    saveFsLater();
+  };
+  for (const [el, which] of [[viewFiles, 'files'], [termViews, 'term']]) {
+    // 捕获阶段先于 xterm 的视口滚动处理截住；stopPropagation 防 Ctrl+滚轮被当成回滚视口
+    el.addEventListener('wheel', (e) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault(); // 拦掉引擎自带的整页缩放，避免和字号调整叠加
+      e.stopPropagation();
+      zoomFs(which, e.deltaY < 0 ? 1 : -1);
+    }, { capture: true, passive: false });
   }
 
   // 终端页签按钮（标题 + 关闭）
@@ -2981,7 +3225,7 @@
     t.deadMsg = deadMsg;
     t.restart = restart;
     restart.onclick = () => {
-      try { window.MinoAgent.termKill({ id: t.id }); } catch { /* 忽略 */ }
+      try { window.KuribohAgent.termKill({ id: t.id }); } catch { /* 忽略 */ }
       if (t.term) t.term.reset();
       startTermBackend(t);
     };
@@ -3027,7 +3271,7 @@
       if (!t.term) return;
       const cols = termCols(t), rows = termRows(t);
       if (cols !== t.term.cols || rows !== t.term.rows) t.term.resize(cols, rows);
-      window.MinoAgent.termResize({ id: t.id, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+      window.KuribohAgent.termResize({ id: t.id, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
     });
     if (t.term) t.term.focus();
   }
@@ -3035,7 +3279,7 @@
   function closeTerminal(id) {
     const t = terminals.get(id);
     if (!t) return;
-    try { window.MinoAgent.termKill({ id }); } catch { /* 忽略 */ }
+    try { window.KuribohAgent.termKill({ id }); } catch { /* 忽略 */ }
     if (t.term) { try { t.term.dispose(); } catch { /* 忽略 */ } }
     if (t.ro) { try { t.ro.disconnect(); } catch { /* 忽略 */ } }
     t.btn.remove();
@@ -3059,7 +3303,7 @@
       cols: termCols(t),
       rows: termRows(t),
       fontFamily: 'Ubuntu Mono, Menlo, Consolas, monospace',
-      fontSize: 13,
+      fontSize: termFs,
       lineHeight: 1.25,
       cursorBlink: true,
       scrollback: 4000,
@@ -3074,7 +3318,7 @@
         const cols = termCols(t), rows = termRows(t);
         if (cols !== t.term.cols || rows !== t.term.rows) {
           t.term.resize(cols, rows);
-          window.MinoAgent.termResize({ id: t.id, cols, rows }).catch(() => {});
+          window.KuribohAgent.termResize({ id: t.id, cols, rows }).catch(() => {});
         }
       });
       ro.observe(t.holder);
@@ -3089,7 +3333,7 @@
       for (let i = 0; i < bytes.length; i += 8192) {
         s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
       }
-      window.MinoAgent.termWrite({ id: t.id, data: btoa(s) });
+      window.KuribohAgent.termWrite({ id: t.id, data: btoa(s) });
     });
     startTermBackend(t);
   }
@@ -3097,7 +3341,7 @@
   async function startTermBackend(t) {
     t.dead.hidden = true;
     try {
-      await window.MinoAgent.termOpen({ id: t.id, cols: t.term.cols, rows: t.term.rows });
+      await window.KuribohAgent.termOpen({ id: t.id, cols: t.term.cols, rows: t.term.rows });
       t.term.focus();
     } catch (err) {
       t.term.writeln('\x1b[31m终端启动失败：' + (err.message || err) + '\x1b[0m');
@@ -3123,14 +3367,29 @@
     }
   };
 
-  waitMinoAgent().then(async () => {
-    catalog = window.MinoAgent.catalog ?? [];
-    applyModels(await window.MinoAgent.getModels());
-    const st = await window.MinoAgent.getSettings();
+  waitKuribohAgent().then(async () => {
+    catalog = window.KuribohAgent.catalog ?? [];
+    applyModels(await window.KuribohAgent.getModels());
+    const st = await window.KuribohAgent.getSettings();
     applySettings(st);
     if (typeof st.panelWidth === 'number' && st.panelWidth >= 160) {
       panelW = clampPanelW(st.panelWidth);
       applyPanelW(); // 恢复上次拖拽保存的面板宽度
+    }
+    if (typeof st.sidebarWidth === 'number') {
+      sideW = clampSideW(st.sidebarWidth);
+      applySideW(); // 恢复上次拖拽保存的会话栏宽度
+    }
+    if (typeof st.chatWidth === 'number') {
+      chatW = clampChatW(st.chatWidth);
+      applyChatW(); // 恢复上次拖拽保存的聊天区内容宽度
+    }
+    if (typeof st.filesFontSize === 'number') {
+      filesFs = Math.min(24, Math.max(8, st.filesFontSize));
+      applyFilesFs(); // 恢复文件页缩放字号
+    }
+    if (typeof st.termFontSize === 'number') {
+      termFs = Math.min(24, Math.max(8, st.termFontSize)); // 终端在 ensureTerm 创建时取 termFs
     }
     renderPermBtn(); // 权限胶囊初始显示（新会话默认：工作区内修改）
     await refreshWorkspaces();
