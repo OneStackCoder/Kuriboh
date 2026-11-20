@@ -1,6 +1,6 @@
 # Kuriboh 沙箱（kuriboh-sandbox）技术原理
 
-Kuriboh 对两类高风险操作做 OS 级沙箱隔离：**系统命令 / 进程启动**（run_command / process_start）与**文件读写搜索**（read_file / write_file / edit_file / list_directory / glob_search / grep_search）。本文说明这套沙箱的架构、平台实现与安全边界；使用层面的依赖与权限说明见 [README.md](README.md)。
+Kuriboh 对三类高风险操作做 OS 级沙箱隔离：**系统命令 / 进程启动**（run_command / process_start）、**文件读写搜索**（read_file / write_file / edit_file / list_directory / glob_search / grep_search）与 **Git 版本操作**（git 工具：status / diff / log / branch / stage / commit / stash / restore / push / pull）。本文说明这套沙箱的架构、平台实现与安全边界；使用层面的依赖与权限说明见 [README.md](README.md)。
 
 ## 为什么是一个 Go sidecar
 
@@ -27,6 +27,7 @@ kuriboh-sandbox（Go sidecar）── 建立沙箱 ──▶ OS 沙箱
 | run_command / process_start（readonly / workspace 级） | `run` / `start` | **硬失败拒绝**，不回退 |
 | read_file / write_file / edit_file / list_directory | `fs read/write/list` | **硬失败拒绝**，不回退 |
 | glob_search / grep_search | `run`（跑捆绑 rg） | **硬失败拒绝**，不回退 |
+| git 工具（readonly / workspace 级） | `run` | **硬失败拒绝**，不回退 |
 
 沙箱内工具一律不回退：这些路径不经用户逐次确认（或属免确认读取），写入 containment 全靠沙箱在执行层硬性保证，静默落到无约束的宿主机即越权——**写路径宁可失败不可越权**。权限级别决定路由：`readonly` 级命令在 `ro` 档全盘只读执行，`workspace` 级在 `ws` 档执行（写入被限制在工作区、临时目录与语言缓存目录内），`full` 级不经沙箱直接在宿主机执行（完全权限语义，不受本沙箱约束）。edit_file 是 `fs read` + `fs write` 的组合：读走 ro 档，写回走 write_file 同一 scope 判定。
 
@@ -34,8 +35,8 @@ kuriboh-sandbox（Go sidecar）── 建立沙箱 ──▶ OS 沙箱
 
 | 档 | 可写范围 | 使用方 |
 | --- | --- | --- |
-| `ro` | 全盘只读（仅私有临时目录可写） | read_file / list_directory / rg 搜索；`readonly` 级 run_command / process_start |
-| `ws` | 工作区 ∪ 临时目录 ∪ 语言缓存目录（npm / NuGet / pip / Go / Cargo / Maven 等默认缓存，见 `sandbox/cache.go`） | `workspace` 级 run_command / process_start；权限面允许的工作区内写入 |
+| `ro` | 全盘只读（仅沙箱私有 /dev 设备节点可写） | read_file / list_directory / rg 搜索；`readonly` 级 run_command / process_start / git 工具 |
+| `ws` | 工作区 ∪ 临时目录 ∪ 语言缓存目录（npm / NuGet / pip / Go / Cargo / Maven 等默认缓存，见 `sandbox/cache.go`） | `workspace` 级 run_command / process_start / git 工具；权限面允许的工作区内写入 |
 | `home` | 工作区 ∪ 用户主目录 ∪ 临时目录 | 经用户确认的工作区外写入（恒含工作区） |
 
 即便用户在确认卡片批准了工作区外写入，OS 也只放开到 `home` 档——写入不可能越过「HOME ∪ 工作区 ∪ 临时目录 ∪ 语言缓存目录」，这就是写入 containment。
@@ -66,7 +67,7 @@ bwrap（bubblewrap）通过 mount namespace 建立隔离：
 - `--dev /dev`、`--proc /proc`——最小设备与进程文件系统；
 - 不加 `--unshare-net`——保留网络：`go mod tidy` / `npm install` 等包管理命令需联网拉依赖；写入 containment 已由只读挂载 + Landlock 保证，网络不在沙箱威胁模型。
 
-Landlock 是 Linux ≥ 5.13 内核自带的 LSM（无需安装，版本满足即自动启用）：对进程施加**内核态写入白名单**，白名单内路径之外的任何写打开直接 EACCES。bwrap 与 Landlock 互相独立、各自生效——bwrap 保证挂载布局，Landlock 保证即使布局被某种方式绕过，写权限仍被内核拦截。启用时机在沙箱内进程 exec 下一个程序之前（见「自 exec 双层设计」）。
+Landlock 是 Linux ≥ 5.13 内核自带的 LSM（无需安装，版本满足即自动启用）：对进程施加**内核态写入白名单**，白名单内路径之外的任何写打开直接 EACCES。bwrap 与 Landlock 互相独立、各自生效——bwrap 保证挂载布局，Landlock 保证即使布局被某种方式绕过，写权限仍被内核拦截。启用时机在沙箱内进程 exec 下一个程序之前（见「自 exec 双层设计」）。写白名单按 scope 与 bwrap 绑定集合同源，额外恒含沙箱内私有 `/dev`（bwrap `--dev` 建的 tmpfs + 从宿主 bind 的设备节点）：`/dev/null` 等是程序常规读写对象（git 一启动就 O_RDWR 打开 /dev/null 探测，shell 重定向更普遍），不放行则 git 在沙箱内直接 fatal；放行只作用于沙箱内私有实例，宿主 /dev 不受牵连（同私有 /tmp 的设计语义）。
 
 ### Windows：Restricted Token（受限访问令牌）+ ACL
 

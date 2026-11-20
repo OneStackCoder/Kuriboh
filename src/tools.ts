@@ -461,6 +461,204 @@ function createSystemTools(workspace: string, permission: PermissionLevel) {
   return [runCommand, processStart, processStop, openApplication];
 }
 
+// ========== Git 工具：对工作区仓库做结构化版本操作 ==========
+// 与 run_command 同一执行通道与权限语义（免确认，写入 containment 由 OS 沙箱按
+// 级别硬性保证：readonly=ro 档、workspace=ws 档、full=宿主机直跑），区别只在
+// 参数：action 是我们定义的枚举（不是自由文本命令），映射成固定 argv 逐个透传、
+// 不经 shell 拼接，天然免疫命令注入，也因此 readonly 级可在工具层预判拒绝写
+// 操作——比让沙箱硬失败省一次 sidecar 往返，错误信息也更友好。
+// 只读操作在 readonly 档恒加 --no-optional-locks：git 官方为只读执行提供的
+// 开关，阻止 status 等命令尝试写 index.lock 刷新 index（当前 git 检测到只读
+// fs 会静默降级，此开关是零成本的语义保底）。
+// paths 一律经 resolveWorkspacePath 收敛到工作区内：结构化工具的基本面校验
+// （ws 档有沙箱兜底，full 档没有，全靠这层校验防 git add 越界路径）。
+
+// branch / stash 的子操作里只有 list 是读，其余（创建 / 切换 / 删除 / push / pop）
+// 都写仓库；顶层 stage / commit / restore / push / pull 恒为写
+function isGitWrite(action: string, branchOp?: string, stashOp?: string): boolean {
+  if (action === "stage" || action === "commit" || action === "restore" || action === "push" || action === "pull")
+    return true;
+  if (action === "branch") return (branchOp ?? "list") !== "list";
+  if (action === "stash") return (stashOp ?? "push") !== "list";
+  return false;
+}
+
+// 选项注入防线：argv 逐个透传不经 shell，唯一注入面是参数被 git 当作选项，
+// 因此自由文本（分支名 / 远端名 / rev）一律禁止以 "-" 开头
+const asGitArg = (v: string | undefined): string | null => {
+  if (typeof v !== "string" || !v.trim() || v.startsWith("-")) return null;
+  return v;
+};
+
+// paths 参数 → 工作区内绝对路径列表；required=false 时缺省表示「不限定路径」
+function resolveGitPaths(
+  workspace: string,
+  paths: string[] | undefined,
+  required: boolean
+): { abs: string[]; error: string | null } {
+  if (!paths || !paths.length)
+    return required ? { abs: [], error: "paths 不能为空" } : { abs: [], error: null };
+  const abs: string[] = [];
+  for (const p of paths) {
+    const { path: target, inside } = resolveWorkspacePath(workspace, p ?? "");
+    if (!inside)
+      return { abs: [], error: `路径必须在当前工作区内：${p}（工作区：${workspace}）` };
+    abs.push(target);
+  }
+  return { abs, error: null };
+}
+
+function createGitTool(workspace: string, permission: PermissionLevel) {
+  return tool(
+    async (args) => {
+      const { action } = args;
+      const err = (msg: string) => `git ${action} 参数错误：${msg}`;
+      // readonly 预判拒绝写操作（枚举语义明确，给切档提示而非让沙箱报晦涩的只读失败）
+      if (permission === "readonly" && isGitWrite(action, args.branchOp, args.stashOp))
+        return "当前为「仅可查看」模式，git 写操作（stage / commit / stash / restore / 分支创建切换删除 / push / pull）不可用。请提示用户切换到「工作区内修改」或「完全权限」后再试。";
+      // 按子命令拼 argv（透传给 exec，不进 shell）
+      const sub: string[] = [];
+      switch (action) {
+        case "status":
+          sub.push("status", "--short", "--branch");
+          break;
+        case "diff": {
+          const rev = asGitArg(args.rev);
+          if (args.rev && !rev) return err("rev 不能为空且不能以 - 开头");
+          const { abs, error } = resolveGitPaths(workspace, args.paths, false);
+          if (error) return err(error);
+          sub.push("diff");
+          if (args.staged) sub.push("--cached");
+          if (rev) sub.push(rev);
+          if (abs.length) sub.push("--", ...abs);
+          break;
+        }
+        case "log": {
+          const rev = asGitArg(args.rev);
+          if (args.rev && !rev) return err("rev 不能为空且不能以 - 开头");
+          const { abs, error } = resolveGitPaths(workspace, args.paths, false);
+          if (error) return err(error);
+          const limit =
+            Number.isInteger(args.limit) && args.limit! >= 1 && args.limit! <= 500 ? args.limit! : 30;
+          sub.push("log", "--oneline", "--decorate=short");
+          if (rev) sub.push(rev);
+          sub.push("-n", String(limit));
+          if (abs.length) sub.push("--", ...abs);
+          break;
+        }
+        case "branch": {
+          const op = args.branchOp ?? "list";
+          if (op === "list") {
+            sub.push("branch", "--all", "--verbose", "--no-color");
+          } else {
+            const name = asGitArg(args.name);
+            if (!name) return err("分支名不能为空且不能以 - 开头");
+            if (op === "create") sub.push("branch", name);
+            else if (op === "switch") sub.push("switch", name);
+            else sub.push("branch", "--delete", name); // -d 只删已合并分支，未合并会拒绝，安全默认
+          }
+          break;
+        }
+        case "stage": {
+          const { abs, error } = resolveGitPaths(workspace, args.paths, false);
+          if (error) return err(error);
+          if (abs.length) {
+            sub.push("add", "--", ...abs);
+          } else {
+            // 不传 paths = 暂存工作区内全部改动（含新增、不含 gitignore）；
+            // 显式锚定 workspace 而非整仓库，工作区是仓库子目录时不越界暂存
+            sub.push("add", "--all", "--", workspace);
+          }
+          break;
+        }
+        case "commit": {
+          if (typeof args.message !== "string" || !args.message.trim())
+            return err("message 必填");
+          sub.push("commit", "--message", args.message);
+          break;
+        }
+        case "stash": {
+          const op = args.stashOp ?? "push";
+          if (op === "list") sub.push("stash", "list");
+          else if (op === "pop") sub.push("stash", "pop");
+          else {
+            sub.push("stash", "push");
+            if (typeof args.message === "string" && args.message.trim())
+              sub.push("--message", args.message);
+          }
+          break;
+        }
+        case "restore": {
+          const { abs, error } = resolveGitPaths(workspace, args.paths, true);
+          if (error) return err(error);
+          sub.push("restore");
+          if (args.staged) sub.push("--staged"); // 只取消暂存、不动工作区文件
+          sub.push("--", ...abs);
+          break;
+        }
+        case "push":
+        case "pull": {
+          const remote = asGitArg(args.remote);
+          if (args.remote && !remote) return err("remote 不能为空且不能以 - 开头");
+          const branch = asGitArg(args.branch);
+          if (args.branch && !branch) return err("branch 不能为空且不能以 - 开头");
+          sub.push(action);
+          if (remote) sub.push(remote);
+          if (branch) sub.push(branch);
+          break;
+        }
+      }
+      // push / pull 走网络，超时放宽到 120 秒，其余 30 秒
+      const timeout = action === "push" || action === "pull" ? 120_000 : 30_000;
+      // 全局选项：--no-pager 防分页挂起；readonly 档加 --no-optional-locks，避免只读执行时尝试写 index.lock
+      const argv = [
+        "--no-pager",
+        ...(permission === "readonly" ? ["--no-optional-locks"] : []),
+        ...sub,
+      ];
+      const clip = (label: string, text: string): string =>
+        text ? `\n${label}：\n${text.length > 8000 ? text.slice(0, 8000) + `\n…（已截断，共 ${text.length} 字符）` : text}` : "";
+      const format = (r: { stdout: string; stderr: string; code: number | null; timedOut: boolean }) => {
+        const head = r.timedOut ? `命令超时（${timeout / 1000} 秒），已终止` : `退出码：${r.code}`;
+        const body = clip("标准输出", r.stdout) + clip("标准错误", r.stderr);
+        return body ? `${head}${body}` : `${head}\n（无输出）`;
+      };
+      // full：不经沙箱直接在宿主机执行（与 run_command 的完全权限路径一致）
+      if (permission === "full")
+        return format(await runShellCommand("git", argv, workspace, timeout));
+      // readonly / workspace：只在 OS 沙箱内执行，沙箱不可用一律硬失败不回退
+      const unavailable = (reason: string | null) =>
+        `git 操作失败：OS 沙箱不可用（${reason || "未知原因"}），「${permission === "readonly" ? "仅可查看" : "工作区内修改"}」级别下 git 工具仅在沙箱内执行、不回退宿主机。修复：npm run build:sandbox（Linux 需安装 bubblewrap），或切换到「完全权限」模式。`;
+      const probe = await isSandboxAvailable();
+      if (!probe.ok) return unavailable(probe.reason);
+      const scope: SandboxScope = permission === "readonly" ? "ro" : "ws";
+      const r = await runInSandbox(["git", ...argv], workspace, timeout, scope);
+      if (r.unavailable !== null) return unavailable(r.unavailable);
+      return format(r);
+    },
+    {
+      name: "git",
+      description:
+        "对当前工作区（git 仓库或其子目录）执行结构化 git 操作，action 可选：status（工作区状态）、diff（改动，staged=true 看已暂存，rev 指定对比基准如 HEAD~1，paths 限定文件）、log（提交历史，rev 指定分支 / 起点，limit 条数默认 30）、branch（branchOp=list/create/switch/delete，默认 list，create/switch/delete 需传 name）、stage（暂存 paths，不传则暂存工作区内全部改动）、commit（提交，message 必填）、stash（stashOp=push/pop/list，默认 push，push 可带 message）、restore（丢弃工作区改动，staged=true 只取消暂存不动文件，paths 必填）、push / pull（远端同步，可指定 remote 与 branch，默认用当前分支的 upstream）。免确认执行：写入限制与 run_command 一致由 OS 沙箱按权限级别硬性保证——「仅可查看」只读操作可用、写操作直接拒绝，「工作区内修改」在沙箱内执行，「完全权限」宿主机直跑。restore 会丢弃未提交改动、push / pull 影响远端仓库，执行前先向用户说明将执行的操作。",
+      schema: z.object({
+        action: z
+          .enum(["status", "diff", "log", "branch", "stage", "commit", "stash", "restore", "push", "pull"])
+          .describe("要执行的 git 操作"),
+        paths: z.array(z.string()).optional().describe("文件 / 目录路径列表（相对工作区），diff / log 可选，restore 必填，stage 不传则暂存全部"),
+        staged: z.boolean().optional().describe("diff：查看已暂存的改动；restore：只取消暂存、不动工作区文件"),
+        rev: z.string().optional().describe("diff / log：对比基准或起点，如 HEAD~1、提交哈希、分支名"),
+        limit: z.number().int().optional().describe("log：返回条数，默认 30，最大 500"),
+        branchOp: z.enum(["list", "create", "switch", "delete"]).optional().describe("branch 子操作，默认 list"),
+        stashOp: z.enum(["push", "pop", "list"]).optional().describe("stash 子操作，默认 push"),
+        name: z.string().optional().describe("branch create / switch / delete 的分支名"),
+        message: z.string().optional().describe("commit 的提交说明（必填）、stash push 的备注"),
+        remote: z.string().optional().describe("push / pull 的远端名，默认 origin 或当前分支 upstream"),
+        branch: z.string().optional().describe("push / pull 的分支名"),
+      }),
+    }
+  );
+}
+
 // ========== 文件操作类（按权限模式管控） ==========
 // 相对路径以工作区为基准解析；工具本身可访问任意绝对路径，
 // 是否需要用户确认由 agent.ts 的 humanInTheLoopMiddleware 按权限级别拦截。
@@ -848,6 +1046,7 @@ export function createTools(
     getCurrentTime,
     ...createFileTools(workspace, permission),
     ...createSystemTools(workspace, permission),
+    createGitTool(workspace, permission),
     createWebSearchTool(search, config),
     webFetchTool,
   ];

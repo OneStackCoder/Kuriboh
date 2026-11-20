@@ -363,11 +363,14 @@ async function runChatStream({
   let confirmCalls: Array<{ name: string; args: unknown; description?: string }> = [];
   try {
     // 首次调用传新消息（完整历史在 agent 内部 state），从中断恢复时传 Command
-    // recursionLimit 提高到 100：搜索 + 逐页抓正文属于正常多步工作流，LangGraph 默认 25 太小
+    // recursionLimit 按 super-step 计数（模型响应 / 每批工具各 1 步），且随会话在
+    // checkpointer 里永久累计——上下文压缩删消息不重置 step，权限确认恢复也推进：
+    // 上限必须按整个会话生命周期估。工具密集型长会话（读框架源码写 demo）一轮即
+    // 消耗上百步，LangGraph 默认 25 与 100 都会中途撞墙；取 1000，真死循环用户可点停止
     const stream = await agent.stream(input, {
       configurable: { thread_id: threadId },
       streamMode: ["messages", "updates"],
-      recursionLimit: 100,
+      recursionLimit: 1000,
       signal,
     });
     let segStarted = false;
@@ -511,7 +514,10 @@ function persistSessions(sessions: SessionMeta[]): void {
 }
 
 // 读取某个线程的完整消息序列
-// 直接从 checkpointer 读取线程状态：不依赖 agent，未配置模型时也能回放历史
+// 直接从 checkpointer 读取线程状态：不依赖 agent，未配置模型时也能回放历史。
+// 当前 state 是压缩后的（摘要 + 最近若干条），仅靠它 UI 会丢失原始对话：
+// 摘要消息的 id 不变地存在于产生它的压缩点之前的全量快照里，据此把每层摘要
+// 展开回被它压缩掉的原始消息——UI 展示完整历史，摘要仍留在 state 里供模型使用。
 async function readThreadMessages(threadId: string): Promise<BaseMessage[]> {
   const tuple = await checkpointer.getTuple({
     configurable: { thread_id: threadId },
@@ -519,7 +525,48 @@ async function readThreadMessages(threadId: string): Promise<BaseMessage[]> {
   const values = (tuple?.checkpoint.channel_values ?? {}) as {
     messages?: BaseMessage[];
   };
-  return values.messages ?? [];
+  const current = values.messages ?? [];
+  const isSummary = (m: BaseMessage) =>
+    m.additional_kwargs?.lc_source === "summarization";
+  if (!current.some(isSummary)) return current; // 未压缩过：当前 state 即全量
+  // list 按新→旧迭代，反转成旧→新；展开一层摘要要看它首次出现的快照的前一个
+  const snaps: BaseMessage[][] = [];
+  for await (const t of checkpointer.list({
+    configurable: { thread_id: threadId },
+  })) {
+    const msgs = (t.checkpoint.channel_values as { messages?: BaseMessage[] })
+      ?.messages;
+    if (msgs?.length) snaps.push(msgs);
+  }
+  snaps.reverse();
+  const result = [...current];
+  const attempted = new Set<BaseMessage>(); // 已处理过的摘要，防死循环
+  for (;;) {
+    const i = result.findIndex(
+      (m) => isSummary(m) && !attempted.has(m)
+    );
+    if (i < 0) break;
+    const s = result[i];
+    attempted.add(s);
+    // 摘要复用被压缩首条消息的 id（RemoveMessage + 同 id 占位语义），且多层压缩
+    // 会生成同 id 不同内容的摘要——按 id+content 双匹配锚定该摘要首次出现的快照，
+    // 其前一个快照即压缩前全量
+    const at = snaps.findIndex((msgs) =>
+      msgs.some(
+        (m) =>
+          isSummary(m) && m.id === s.id && String(m.content) === String(s.content)
+      )
+    );
+    const prev = at > 0 ? snaps[at - 1] : undefined;
+    // seen 先剔除摘要自身的 id：压缩点前快照里该 id 是原始消息本体，不去重掉
+    // 摘要占位的话原始消息（通常正是首条用户消息）永远找不回
+    const seen = new Set(
+      result.filter((m) => m.id !== s.id).map((m) => m.id)
+    );
+    const missing = (prev ?? []).filter((m) => m.id && !seen.has(m.id));
+    if (missing.length) result.splice(i, 1, ...missing);
+  }
+  return result; // 展开不了的摘要（前驱快照缺失）保留原样，由 summary 分支兜底展示
 }
 
 // 把 checkpointer 里的消息序列转成前端可渲染的历史条目
@@ -532,16 +579,15 @@ function historyToItems(messages: BaseMessage[]): HistoryItem[] {
     aiEvents = null;
   };
   for (const msg of messages) {
-    if (msg instanceof HumanMessage) {
-      flushAi();
-      items.push({ role: "user", text: chunkText(msg.content) });
-    } else if (
-      msg instanceof AIMessage &&
-      msg.additional_kwargs?.lc_source === "summarization"
-    ) {
-      // 上下文压缩产生的摘要消息（保留在 state 里供模型使用），单独成一条展示
+    if (msg.additional_kwargs?.lc_source === "summarization") {
+      // 兜底：readThreadMessages 已把摘要展开回原始消息，展开失败的层才到这里
+      //（不能按 instanceof 排——langchain 的摘要实际是 HumanMessage，落在前面
+      // 会被误渲染成用户消息）
       flushAi();
       items.push({ role: "summary", text: chunkText(msg.content) });
+    } else if (msg instanceof HumanMessage) {
+      flushAi();
+      items.push({ role: "user", text: chunkText(msg.content) });
     } else if (msg instanceof AIMessage) {
       if (!aiEvents) aiEvents = [];
       // 思维链（落盘消息里保留的）先于正文/工具事件回放，与流式顺序一致
@@ -1426,6 +1472,9 @@ export function startWebUI(): void {
           } catch (err) {
             // 用户主动停止不算错误：已收到的增量保留，前端打「已停止」标记
             if (controller.signal.aborted) pushT({ type: "stopped" });
+            else if (err instanceof Error && err.message.includes("Recursion limit"))
+              // step 随会话永久累计，撞上限≈模型在重复工具循环或会话已极长
+              pushT({ type: "error", message: "本轮执行步数超过上限，模型可能陷入了重复操作；建议点停止后精简要求重试，或新建会话继续。" });
             else pushT({ type: "error", message: err instanceof Error ? err.message : String(err) });
           } finally {
             runningChats.delete(tid);

@@ -31,7 +31,7 @@ sudo apt install libwebkit2gtk-4.1-0 libxdo3 zenity util-linux bubblewrap
 ```
 
 ### 沙箱安全
-沙箱的技术原理、平台实现与安全边界详见 [README-sandbox.md](README-sandbox.md)。
+沙箱的技术原理、平台实现与安全边界详见 [README-sandbox.md](README-sandbox.md)。系统命令、文件读写搜索与 Git 版本操作（status / diff / log / branch / stage / commit / stash / restore / push / pull）均在 OS 沙箱内执行（「完全权限」级别除外），写入越界一律硬失败、不回退宿主机；`readonly` 级别下 Git 仅只读操作可用。
 
 ## 运行
 
@@ -73,4 +73,6 @@ middleware: [
   }),
 ],
 ```
+
+压缩只作用于模型的上下文，不影响界面展示：重新打开会话时，`readThreadMessages`（[src/web.ts](src/web.ts)）会沿 checkpoint 链把每层摘要展开回被它压缩掉的原始消息，UI 始终显示完整对话历史；仅当前驱快照缺失、某层摘要展开失败时，才降级显示为「早期对话已自动压缩为摘要」卡片。
 

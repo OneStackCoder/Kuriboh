@@ -19,17 +19,22 @@ import (
 )
 
 // 写白名单映射，与 bwrap 绑定集合同源（linux.go bwrapCommand）：
-// ro=∅（read/list 恒只读档，全盘禁写含私有 /tmp）；ws=工作区∪/tmp∪语言缓存目录；
+// ro=仅私有 /dev（read/list 恒只读档，其余全盘禁写含私有 /tmp）；
+// ws=工作区∪/tmp∪语言缓存目录；
 // home=工作区∪HOME∪/tmp（恒含工作区，与 bwrap home 档一致，缓存目录在 HOME 下天然覆盖）。
 // HOME 有效性由外层 sandboxRun home 档先行校验。
+// 三档恒含 /dev：bwrap --dev 建的私有实例（tmpfs + 从宿主 bind 的设备节点），
+// /dev/null 等是程序常规读写对象（git 一启动就 O_RDWR 打开 /dev/null 探测，
+// shell 重定向更普遍），不放行则 git 在沙箱内直接 fatal；放行只作用于沙箱内
+// 私有实例，宿主 /dev 不受牵连（同私有 /tmp 的设计语义）。
 func landlockWritableDirs(scope, cwd string) []string {
 	switch scope {
 	case "home":
-		return []string{cwd, os.Getenv("HOME"), "/tmp"}
+		return []string{"/dev", cwd, os.Getenv("HOME"), "/tmp"}
 	case "ro":
-		return nil
+		return []string{"/dev"}
 	default: // ws
-		return append([]string{cwd, "/tmp"}, langCacheDirs()...)
+		return append([]string{"/dev", cwd, "/tmp"}, langCacheDirs()...)
 	}
 }
 

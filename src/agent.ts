@@ -155,15 +155,17 @@ function buildInterruptOn(workspaceDir: string, permission: PermissionLevel): Re
 export function createKuribohAgent(config: AgentConfig, workspaceDir: string, permission: PermissionLevel, search: SearchSettings) {
   return createAgent({
     model: buildModel(config),
-    // 计算器 / 时间 / 文件操作与搜索（写入按权限模式管控）/ 信息检索（Bocha 开关与模型商搜索）/ 系统工具（命令与进程，写入 containment 交 OS 沙箱，不弹确认），定义见 src/tools.ts
+    // 计算器 / 时间 / 文件操作与搜索（写入按权限模式管控）/ 信息检索（Bocha 开关与模型商搜索）/ 系统工具（命令与进程，写入 containment 交 OS 沙箱，不弹确认）/ git 工具（结构化版本操作，与 run_command 同一沙箱通道与免确认语义），定义见 src/tools.ts
     tools: createTools(workspaceDir, permission, search, config),
     systemPrompt:
-      "你是一个乐于助人的中文助手。可使用提供的工具（计算、获取时间、文件读写、文件搜索、信息检索、系统命令与进程管理）完成任务和回答问题。" +
+      "你是一个乐于助人的中文助手。可使用提供的工具（计算、获取时间、文件读写、文件搜索、信息检索、系统命令与进程管理、Git 版本操作）完成任务和回答问题。" +
       "需要操作本机系统时：run_command 执行命令（查询 CPU、内存、磁盘、网络、进程列表等），process_start 启动程序，process_stop 终止 Kuriboh 启动的进程，open_application 打开应用、文件或网址；" +
+      "工作区是 git 仓库时，版本操作一律用 git 工具（status / diff / log / branch / stage / commit / stash / restore / push / pull），不要用 run_command 拼 git 命令；git 工具免确认执行，写入限制与 run_command 一致在执行层由 OS 沙箱硬性保证——「仅可查看」级别只读操作可用、写操作会被直接拒绝，其他级别写操作可用；restore 会丢弃未提交改动、push / pull 影响远端仓库，执行前先向用户说明将执行的操作；" +
       "run_command / process_start 不弹确认，写入限制在执行层由 OS 沙箱硬性保证：「仅可查看」级别全盘只读执行，「工作区内修改」级别写入被限制在工作区、临时目录与语言缓存目录内，「完全权限」级别不经沙箱直接在宿主机执行；沙箱内命令可正常联网（如 go mod tidy、npm install）；沙箱内跑不了 GUI 程序，打开应用请用 open_application；" +
       "沙箱内命令写入越界会直接失败：如实向用户报告失败原因，不要换写法反复重试，改用 write_file / edit_file 工具（会按目标路径请用户确认）或提示用户切换权限模式；OS 沙箱不可用时这些命令在「仅可查看」与「工作区内修改」级别下会直接报错、不回退宿主机，「完全权限」不受影响；" +
       "process_stop 无需确认，但只能终止 Kuriboh 自己启动的进程；open_application 在宿主机执行，「完全权限」外执行前会请用户确认，被拒绝后不要换个写法重试；" +
       "按文件名或路径模式找文件用 glob_search，在文件内容里找文本用 grep_search，找到路径后再用 read_file 读取；" +
+      "查代码（含框架 / 依赖包源码，如 GOMODCACHE、node_modules）一律走这三个工具，它们都能以绝对路径访问工作区外的文件；不要用 run_command 拼 grep / sed / cat 等命令读代码——多条相近命令逐个试既慢又费步数；" +
       "文件读写与搜索均在 OS 沙箱内执行（系统目录只读、写入仅限工作区、用户主目录与临时目录）；沙箱不可用或写入越界时这些工具会直接报错失败，不会回退到宿主机执行，失败时如实告知用户原因；" +
       "信息检索时调用一次 web_search 通常已足够，不要对同一问题反复搜索；需要正文时再用 web_fetch 读取具体链接。" +
       `当前工作区目录为 ${workspaceDir}，相对路径以工作区为基准；` +
